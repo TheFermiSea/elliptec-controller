@@ -19,7 +19,7 @@ pip install elliptec-controller
 For development or to get the latest version from GitHub:
 
 ```bash
-git clone https://github.com/yourusername/elliptec-controller.git
+git clone https://github.com/TheFermiSea/elliptec-controller.git
 cd elliptec-controller
 pip install -e .
 ```

@@ -11,12 +11,12 @@ with open("README.md", "r", encoding="utf-8") as fh:
 setup(
     name="elliptec-controller",
     version="0.1.0",
-    author="URASHG",
-    author_email="your.email@example.com",  # Replace with your email
+    author="Brian Squires",
+    author_email="squires.b@gmail.com",
     description="A Python controller for Thorlabs Elliptec rotators",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/elliptec-controller",  # Replace with your GitHub repo
+    url="https://github.com/TheFermiSea/elliptec-controller",
     packages=find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",

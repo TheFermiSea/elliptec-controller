@@ -18,9 +18,9 @@ Follow these steps to create a new GitHub repository for the elliptec-controller
    git commit -m "Initial commit"
    ```
 
-3. Connect to the remote repository (replace 'yourusername' with your GitHub username):
+3. Connect to the remote repository:
    ```bash
-   git remote add origin https://github.com/yourusername/elliptec-controller.git
+   git remote add origin https://github.com/TheFermiSea/elliptec-controller.git
    git branch -M main
    git push -u origin main
    ```
