@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elliptec-controller"
+version = "0.1.0"
+description = "A Python controller for Thorlabs Elliptec rotators"
+authors = [{ name = "Brian Squires", email = "squires.b@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.6"
+license = { file = "LICENSE" }
+dependencies = ["pyserial>=3.5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=6.0.0", "pytest-cov>=2.0.0"]
+
+[project.scripts]
+elliptec-controller = "elliptec_controller.cli:main"
+
+[tool.black]
+line-length = 100
+target-version = ['py36', 'py37', 'py38', 'py39', 'py310']
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
