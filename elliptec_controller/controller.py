@@ -28,9 +28,7 @@ COMMAND_SET_VELOCITY = "sv"  # Set velocity (_HOSTSET_VELOCITY "sv")
 COMMAND_GET_VELOCITY = "gv"  # Get velocity (_HOSTREQ_VELOCITY "gv")
 COMMAND_SET_HOME_OFFSET = "so"  # Set home offset (_HOSTSET_HOMEOFFSET "so")
 COMMAND_GET_HOME_OFFSET = "go"  # Get home offset (_HOSTREQ_HOMEOFFSET "go")
-COMMAND_FREQUENCY_SEARCH = (
-    "s1"  # Search for optimal frequency for motor 1 (_HOSTREQ_SEARCHFREQ_MOTOR1 "s1")
-)
+COMMAND_OPTIMIZE_MOTORS = "om"  # Optimize motors (_HOST_OPTIMIZE_MOTORS "om")
 COMMAND_GET_INFO = "in"  # Get device information (_DEVGET_INFORMATION "IN")
 COMMAND_SET_JOG_STEP = "sj"  # Set jog step size
 COMMAND_GET_JOG_STEP = "gj"  # Get jog step size
@@ -560,39 +558,36 @@ class ElliptecRotator:
             # Stop the movement
             return self.stop()
 
-    def search_optimal_frequency(self) -> bool:
+    def optimize_motors(self, wait: bool = True) -> bool:
         """
-        Search for the optimal frequency for the rotator.
+        Optimize both motors using the 'om' command.
 
-        This command can take up to 30 seconds to complete, as it scans
-        through frequencies to find the optimal value for this specific device.
+        Note: The manual states this command applies only to specific devices
+        (ELL14, ELL15, ELL17, ELL18, ELL20).
 
-        According to the protocol manual, the search frequency command is motor-specific:
-        - s1 for motor 1 (_HOSTREQ_SEARCHFREQ_MOTOR1)
-        - s2 for motor 2 (_HOSTREQ_SEARCHFREQ_MOTOR2)
+        Args:
+            wait: Whether to wait for the optimization process to complete.
+                  Optimization can take a significant amount of time.
 
         Returns:
-            bool: True if the search was started successfully
+            bool: True if the command was acknowledged successfully, False otherwise.
+                  Note that acknowledgement doesn't mean optimization completed if wait=False.
         """
-        # Determine which search frequency command to use based on address
-        if self.address == "1" or self.address == "0":
-            search_cmd = "s1"  # Motor 1 search frequency command
-        elif self.address == "2":
-            search_cmd = "s2"  # Motor 2 search frequency command
-        else:
-            # For other addresses, default to motor 1 command
-            search_cmd = "s1"
-            print(
-                f"Warning: Using motor 1 search frequency command for address {self.address}"
-            )
+        # Command structure is simply <addr>om
+        response = self.send_command(COMMAND_OPTIMIZE_MOTORS)
 
-        response = self.send_command(search_cmd)
-
-        # The response should be GS = getting status
+        # Device should respond with GS status. Optimization starts in background.
         if response and response.startswith(f"{self.address}GS"):
-            self.is_moving = True
-            return True
+            # Status might initially indicate busy (e.g., '0A')
+            if wait:
+                print(f"Waiting for motor optimization on {self.name} to complete...")
+                # Need a long timeout for optimization
+                # We wait until status is '00' (Ready)
+                # TODO: Refine wait logic based on expected busy codes during optimization
+                return self.wait_until_ready(timeout=60.0) # Use a long timeout (e.g., 60 seconds)
+            return True # Command acknowledged
 
+        print(f"Failed to start motor optimization on {self.name}. Response: {response}")
         return False
 
     def get_device_info(self, debug: bool = False) -> Dict[str, str]:

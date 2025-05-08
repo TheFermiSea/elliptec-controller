@@ -529,6 +529,6 @@ def test_triple_controller_stop_all(triple_controller, mock_serial_port):
 
 
 # Add more tests for other methods:
-# - set_velocity, set_jog_step, search_optimal_frequency, continuous_move for ElliptecRotator
+# - set_velocity, set_jog_step, optimize_motors, continuous_move for ElliptecRotator
 # - is_all_ready, set_all_velocities, move_all_relative for TripleRotatorController
 # - Edge cases: timeouts, error responses (e.g., GS0C), invalid parameters
