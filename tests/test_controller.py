@@ -10,7 +10,7 @@ try:
     # Assuming test is run from elliptec-controller directory or PYTHONPATH is set
     from elliptec_controller.controller import (
         ElliptecRotator,
-        TripleRotatorController,
+        # TripleRotatorController, # Removed
         degrees_to_hex,
         hex_to_degrees,
     )

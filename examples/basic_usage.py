@@ -1,115 +1,81 @@
+```python
 #!/usr/bin/env python3
 """
-Basic demonstration of the elliptec-controller package.
-
-This example shows how to initialize and control a single rotator
-and how to work with a triple rotator setup.
+Basic Usage Example for Elliptec Controller
+Demonstrates connecting to a single rotator, homing, moving, and getting status.
 """
 
-import time
 import serial
-from elliptec_controller import ElliptecRotator, TripleRotatorController
+from elliptec_controller import ElliptecRotator
+import time
 
-def single_rotator_demo(port_name="/dev/ttyUSB0"):
-    """
-    Demonstrate control of a single rotator.
-    
-    Args:
-        port_name: Serial port where the rotator is connected
-    """
-    print("=== Single Rotator Demo ===")
-    
-    # Open a serial connection
-    ser = serial.Serial(port_name, baudrate=9600, timeout=1)
-    
-    # Create a rotator instance
-    rotator = ElliptecRotator(ser, motor_address=1, name="TestRotator")
-    
-    try:
-        # Get device info
-        device_info = rotator.get_device_info(debug=True)
-        print(f"Device info: {device_info}")
-        
-        # Home the rotator
-        print("Homing rotator...")
-        rotator.home(wait=True)
-        print("Homing complete")
-        
-        # Move to specific positions
-        for angle in [0, 45, 90, 135, 180]:
-            print(f"Moving to {angle} degrees...")
-            rotator.move_absolute(angle, wait=True)
-            print(f"Position reached: {angle} degrees")
-            time.sleep(1)
-        
-        # Return to home
-        print("Returning to home position...")
-        rotator.home(wait=True)
-        print("Homing complete")
-        
-    finally:
-        # Close the serial port
-        ser.close()
-        print("Serial connection closed")
+# Configuration
+SERIAL_PORT = "/dev/ttyUSB0"  # <-- IMPORTANT: Replace with your serial port name
+MOTOR_ADDRESS = 1           # <-- IMPORTANT: Replace with your device's address (0-F)
 
-def triple_rotator_demo(port_name="/dev/ttyUSB0"):
-    """
-    Demonstrate control of a triple rotator setup.
-    
-    Args:
-        port_name: Serial port where the rotators are connected
-    """
-    print("\n=== Triple Rotator Demo ===")
-    
-    # Create a controller with three rotators
-    controller = TripleRotatorController(
-        port=port_name,
-        addresses=[3, 6, 8],
-        names=["HWP1", "QWP", "HWP2"]
+# Using a specific serial port
+try:
+    print(f"Connecting to rotator at address {MOTOR_ADDRESS} on port {SERIAL_PORT}...")
+    # Create a rotator instance - this opens the port and gets device info
+    rotator1 = ElliptecRotator(
+        port=SERIAL_PORT,
+        motor_address=MOTOR_ADDRESS,
+        name=f"Rotator-{MOTOR_ADDRESS}",
+        debug=True           # Enable debug output for detailed info
     )
-    
-    try:
-        # Check if all rotators are ready
-        ready = controller.is_all_ready()
-        print(f"All rotators ready: {ready}")
-        
-        # Home all rotators
-        print("Homing all rotators...")
-        controller.home_all(wait=True)
-        print("Homing complete")
-        
-        # Set velocities
-        print("Setting velocities...")
-        controller.set_all_velocities(40)
-        print("Velocities set")
-        
-        # Move to specific positions
-        print("Moving to positions...")
-        controller.move_all_absolute([30, 45, 60], wait=True)
-        print("Positions reached")
-        
-        # Wait a moment
-        time.sleep(2)
-        
-        # Move relative
-        print("Moving relative...")
-        controller.move_all_relative([10, 15, 20], ["cw", "cw", "ccw"], wait=True)
-        print("Relative movement complete")
-        
-        # Return to home
-        print("Returning to home positions...")
-        controller.home_all(wait=True)
-        print("Homing complete")
-        
-    finally:
-        # Close the controller
-        controller.close()
-        print("Controller closed")
 
-if __name__ == "__main__":
-    # Replace with your actual serial port
-    PORT = "/dev/ttyUSB0"
-    
-    # Run demos - uncomment as needed
-    # single_rotator_demo(PORT)
-    # triple_rotator_demo(PORT)
+    # Print device info (retrieved during initialization)
+    print("\n--- Device Information ---")
+    if rotator1.device_info and rotator1.device_info.get("type") != "Unknown":
+        print(f"  Device Info: {rotator1.device_info}")
+        print(f"  Pulses per Revolution: {rotator1.pulse_per_revolution}")
+    else:
+        print("  Could not retrieve valid device info.")
+        # Optionally raise an error or exit if info is critical
+        # raise ConnectionError("Failed to get device info")
+
+    # Home the rotator
+    print("\n--- Homing ---")
+    print("Homing...")
+    if rotator1.home(wait=True):
+        print("Homing complete.")
+    else:
+        print("Homing failed.")
+    time.sleep(1)
+
+    # Move to an absolute position (in degrees)
+    target_pos = 90.0
+    print(f"\n--- Moving to {target_pos} degrees ---")
+    if rotator1.move_absolute(target_pos, wait=True):
+        print("Move complete.")
+    else:
+        print("Move failed.")
+    time.sleep(1)
+
+    # Get the current position
+    print("\n--- Checking Position ---")
+    position = rotator1.update_position(debug=True)
+    print(f"Current reported position: {position:.2f} degrees")
+
+    # Example of getting status code
+    status_code = rotator1.get_status(debug=True)
+    print(f"Current status code: {status_code} (00 means OK/Ready)")
+
+    print("\nBasic usage example finished.")
+
+except serial.SerialException as e:
+    print(f"\n--- Serial Port Error ---")
+    print(f"Could not open or communicate on port '{SERIAL_PORT}'.")
+    print(f"Error details: {e}")
+    print("Please check if the port name is correct and the device is connected.")
+except Exception as e:
+    print(f"\n--- An Error Occurred ---")
+    print(f"Error details: {e}")
+
+finally:
+    # The ElliptecRotator class handles closing the serial port implicitly
+    # when the object is destroyed if it opened the port itself (by passing a string name).
+    # No explicit close call is needed here in that case.
+    print("\nCleanup: Port will be closed automatically if opened by the class.")
+
+```

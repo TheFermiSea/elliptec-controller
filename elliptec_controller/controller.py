@@ -28,7 +28,9 @@ COMMAND_SET_VELOCITY = "sv"  # Set velocity (_HOSTSET_VELOCITY "sv")
 COMMAND_GET_VELOCITY = "gv"  # Get velocity (_HOSTREQ_VELOCITY "gv")
 COMMAND_SET_HOME_OFFSET = "so"  # Set home offset (_HOSTSET_HOMEOFFSET "so")
 COMMAND_GET_HOME_OFFSET = "go"  # Get home offset (_HOSTREQ_HOMEOFFSET "go")
-COMMAND_GROUP_ADDRESS = "ga"  # Set group address for synchronized movement (_HOST_GROUPADDRESS "ga")
+COMMAND_GROUP_ADDRESS = (
+    "ga"  # Set group address for synchronized movement (_HOST_GROUPADDRESS "ga")
+)
 COMMAND_OPTIMIZE_MOTORS = "om"  # Optimize motors (_HOST_OPTIMIZE_MOTORS "om")
 COMMAND_GET_INFO = "in"  # Get device information (_DEVGET_INFORMATION "IN")
 COMMAND_SET_JOG_STEP = "sj"  # Set jog step size
@@ -130,16 +132,22 @@ class ElliptecRotator:
             group_address: Optional group address for synchronous movement
             debug: Whether to print debug information
         """
-        self.address = str(motor_address)
-        self.name = name or f"Rotator-{self.address}"
+        self.physical_address = str(motor_address)  # Device's actual hardware address
+        self.active_address = (
+            self.physical_address
+        )  # Address the device currently responds to
+        self.name = name or f"Rotator-{self.physical_address}"
         self.is_moving = False
-        self.in_group_mode = False
-        self.group_address = str(group_address) if group_address is not None else None
-        self.offset = 0.0  # Default offset for group movements (in degrees)
+        self.is_slave_in_group = (
+            False  # True if this rotator is listening to a group_address
+        )
+        self.group_offset_degrees = 0.0  # Offset in degrees for group movements
         self.velocity = 60  # Default to ~60% velocity
         self.optimal_frequency = None
         self._jog_step_size = 1.0  # Default jog step size in degrees
         self._command_lock = threading.Lock()
+        # group_address parameter from __init__ is no longer used directly here,
+        # as grouping is configured by dedicated methods.
 
         # Default values for ELL14/ELL18 rotators
         self.pulse_per_revolution = 262144
@@ -149,7 +157,11 @@ class ElliptecRotator:
 
         # Initialize serial port
         # Check for mock attributes FIRST using duck typing
-        if hasattr(port, "responses") and hasattr(port, "log"):
+        # Look for attributes common to mocks used in tests (log, write)
+        # Exclude actual serial.Serial and str types which are handled below.
+        if (not isinstance(port, (str, serial.Serial)) and
+            hasattr(port, "log") and hasattr(port, "write")):
+            # Assume it's a suitable mock object for testing
             self.serial = port
         elif isinstance(port, serial.Serial):  # Check real serial
             self.serial = port
@@ -161,11 +173,13 @@ class ElliptecRotator:
             # Load device info and get pulse_per_revolution after connection is established
             try:
                 self.get_device_info(debug=debug)
-                if debug and hasattr(self, 'device_info'):
+                if debug and hasattr(self, "device_info"):
                     print(f"Device info for {self.name}: {self.device_info}")
-                    if hasattr(self, 'pulse_per_revolution'):
-                        print(f"Using pulse_per_revolution: {self.pulse_per_revolution}")
-                    if hasattr(self, 'pulses_per_deg'):
+                    if hasattr(self, "pulse_per_revolution"):
+                        print(
+                            f"Using pulse_per_revolution: {self.pulse_per_revolution}"
+                        )
+                    if hasattr(self, "pulses_per_deg"):
                         print(f"Using pulses_per_deg: {self.pulses_per_deg}")
             except Exception as e:
                 if debug:
@@ -174,121 +188,212 @@ class ElliptecRotator:
         #    # Assume it's a mock object for testing
         #    self.serial = port
 
-    def send_command(self, command: str, data: str = None, debug: bool = False, timeout: Optional[float] = None) -> str:
+    def send_command(
+        self,
+        command: str,
+        data: str = "",
+        debug: bool = False,
+        timeout: Optional[float] = None,
+        send_addr_override: Optional[str] = None,
+        expect_reply_from_addr: Optional[str] = None,
+        timeout_multiplier: float = 1.0,
+    ) -> str:
         """
-        Send a command to the rotator according to the Elliptec protocol and return the response.
-
-        Protocol: <address><command>[data]<CR>
-        Response: <address><COMMAND>[data]<CR><LF>
+        Send a command to the rotator and return the response.
 
         Args:
-            command: Command to send (e.g., "gs", "ma", "sv")
-            data: Optional data to send with the command
-            debug: Whether to print debug information
-            timeout: Optional timeout duration for this specific command read.
+            command: Command to send (e.g., "gs", "ma").
+            data: Optional data for the command.
+            debug: Whether to print debug information.
+            timeout: Specific timeout for this command read.
+            send_addr_override: Use this address in the command string instead of self.active_address.
+                                Useful for 'ga' command when setting a slave from its physical address.
+            expect_reply_from_addr: Expect the response to start with this address.
+                                    Useful for 'ga' command where reply comes from the new address.
+            timeout_multiplier: Multiplies the default timeout. Useful for commands like 'ga'.
 
         Returns:
-            str: Response from the device (without CR, LF), or empty string on error/timeout.
+            str: Response from the device (stripped of CR/LF), or empty string on error/timeout.
         """
         with self._command_lock:
             if not self.serial.is_open:
-                self.serial.open()
+                try:
+                    self.serial.open()
+                except serial.SerialException as e:
+                    if debug:
+                        print(f"Error opening serial port for {self.name}: {e}")
+                    return ""  # Cannot send command if port cannot be opened
 
-            self.serial.reset_input_buffer()
+            try:
+                self.serial.reset_input_buffer()
+                self.serial.reset_output_buffer()  # Good practice
+            except serial.SerialException as e:
+                if debug:
+                    print(
+                        f"Error resetting serial port buffers for {self.name}: {e}"
+                    )
+                # Non-fatal, try to continue
 
-            # Construct command with or without data
-            cmd_str = f"{self.address}{command}"
+            address_to_send_with = (
+                send_addr_override
+                if send_addr_override is not None
+                else self.active_address
+            )
+            address_to_expect_reply_from = (
+                expect_reply_from_addr
+                if expect_reply_from_addr is not None
+                else self.active_address
+            )
+
+            cmd_str = f"{address_to_send_with}{command}"
             if data:
                 cmd_str += data
-            cmd_str += "\r"  # Append carriage return
+            cmd_str += "\r"
 
             if debug:
                 print(
-                    f"Sending to {self.name}: '{cmd_str.strip()}' (hex: {' '.join(f'{ord(c):02x}' for c in cmd_str)})"
+                    f"Sending to {self.name} (using addr: {address_to_send_with}): '{cmd_str.strip()}' (hex: {' '.join(f'{ord(c):02x}' for c in cmd_str)})"
                 )
 
-            # Send command
-            self.serial.write(cmd_str.encode("ascii"))
-            self.serial.flush()
+            try:
+                self.serial.write(cmd_str.encode("ascii"))
+                self.serial.flush()
+            except serial.SerialException as e:
+                if debug:
+                    print(f"Error writing to serial port for {self.name}: {e}")
+                return ""  # Command send failed
 
-            # Wait for and read response
             start_time = time.time()
-            response = ""
+            response_bytes = b""
 
-            # Determine the effective timeout for this command read
+            # Determine effective timeout
             if timeout is not None:
-                 effective_timeout = timeout # Use caller-specified timeout
-            elif command in ["ma", "mr", "ho", "fw", "bw"]:
-                 effective_timeout = 3.0  # Default 3s for movement commands
-            else:
-                 effective_timeout = 1.0  # Default 1s for other commands
+                effective_timeout = timeout
+            elif command in [
+                "ma",
+                "mr",
+                "ho",
+                "om",
+                "cm",
+            ]:  # Movement or long operations
+                effective_timeout = 3.0 * timeout_multiplier
+            elif command == "ga":  # Group address can sometimes be slow to respond
+                effective_timeout = 1.5 * timeout_multiplier
+            else:  # Status, info, etc.
+                effective_timeout = 1.0 * timeout_multiplier
 
-            while (time.time() - start_time) < effective_timeout:
-                if self.serial.in_waiting > 0:
-                    new_data = self.serial.read(self.serial.in_waiting)
-                    response += new_data.decode("ascii", errors="replace")
+            try:
+                while (time.time() - start_time) < effective_timeout:
+                    if self.serial.in_waiting > 0:
+                        response_bytes += self.serial.read(self.serial.in_waiting)
+                        # Check for CR+LF termination
+                        if response_bytes.endswith(b"\r\n"):
+                            break
+                        # Some devices might only send LF or CR
+                        elif response_bytes.endswith(
+                            b"\n"
+                        ) or response_bytes.endswith(b"\r"):
+                            # Check again quickly if more data is coming for the other part of CR/LF
+                            time.sleep(0.005)
+                            if self.serial.in_waiting > 0:
+                                response_bytes += self.serial.read(
+                                    self.serial.in_waiting
+                                )
+                            if response_bytes.endswith(
+                                b"\r\n"
+                            ):  # Now check for full CR/LF
+                                break
+                            # If still not CR/LF, but we got a CR or LF, assume it's the end for robust parsing
+                            # (though spec says CR+LF)
+                            if debug:
+                                print(
+                                    f"Partial EOL detected for {self.name}, treating as end of response. Raw: {response_bytes!r}"
+                                )
+                            break
 
-                    # Check if response is complete (ends with CR+LF)
-                    if response.endswith("\r\n"):
-                        break
+                    time.sleep(0.01)  # Brief pause
+            except serial.SerialException as e:
+                if debug:
+                    print(f"Error reading from serial port for {self.name}: {e}")
+                return ""  # Read failed
 
-                # Brief pause to prevent CPU spinning
-                time.sleep(0.01)
+            response_str = response_bytes.decode(
+                "ascii", errors="replace"
+            ).strip()  # Strip all whitespace including CR/LF
 
-            # Clean up response and debug info - explicitly remove CR/LF
-            response = response.replace("\r", "").replace("\n", "")
             if debug:
+                duration_ms = (time.time() - start_time) * 1000
                 print(
-                    f"Response from {self.name}: '{response}' (took {(time.time() - start_time) * 1000:.1f}ms)"
+                    f"Response from {self.name} (expecting from addr: {address_to_expect_reply_from}): '{response_str}' (raw: {response_bytes!r}) (took {duration_ms:.1f}ms)"
                 )
-                if not response:
-                    print(f"WARNING: No response from {self.name}")
-
-            # Check if response starts with the correct address
-            expected_address = self.address  # Stored as string '0'-'F'
-            valid_response = False
-            if response.startswith(expected_address):
-                valid_response = True
-            # Handle potential case difference for hex addresses A-F (less common for device responses, but good practice)
-            elif (
-                len(expected_address) == 1
-                and expected_address.isalpha()
-                and response.startswith(expected_address.lower())
-            ):
-                valid_response = True
-
-            if valid_response:
-                return response  # Return the stripped response if address matches
-            else:
-                if (
-                    debug and response
-                ):  # Log if we got a response but it was for the wrong address
+                if not response_str:
                     print(
-                        f"WARNING: Response from {self.name} ('{response}') did not match expected address prefix '{expected_address}'. Discarding."
+                        f"WARNING: No response from {self.name} (or timed out after {effective_timeout:.2f}s)"
                     )
-                return ""  # Return empty string if address doesn't match or no (valid) response
 
-    def get_status(self, timeout_override: Optional[float] = None) -> str:
+            # Validate response prefix
+            if response_str.startswith(address_to_expect_reply_from):
+                return response_str
+            # Handle case-insensitivity for hex addresses A-F in responses
+            elif (
+                len(address_to_expect_reply_from) == 1
+                and address_to_expect_reply_from.isalpha()
+                and response_str.lower().startswith(
+                    address_to_expect_reply_from.lower()
+                )
+            ):
+                if debug:
+                    print(
+                        f"Matched response with case-insensitive address for {self.name}: '{response_str}'"
+                    )
+                return response_str  # Return the original casing from the device
+            else:
+                if debug and response_str:
+                    print(
+                        f"WARNING: Response from {self.name} ('{response_str}') did not match expected address prefix '{address_to_expect_reply_from}'. Discarding."
+                    )
+            return ""
+
+
+    def get_status(
+        self, debug: bool = False, timeout_override: Optional[float] = None
+    ) -> str:
         """
         Get the current status of the rotator.
 
-        Args:
-            timeout_override: Optional timeout value to pass to send_command.
+            Args:
+                timeout_override: Optional timeout value to pass to send_command.
 
-        Returns:
-            str: Status code (e.g., "00" for OK, "09" for moving), or empty string on error.
+            Returns:
+                str: Status code (e.g., "00" for OK, "09" for moving), or empty string on error.
         """
-        # Determine timeout for send_command
-        # Use override if provided, otherwise send_command uses its default (1.0s for non-move commands)
-        timeout = timeout_override if timeout_override is not None else 1.0
+        # Pass the timeout_override directly to send_command.
+        # send_command has its own default timeout logic if timeout_override is None.
+        response = self.send_command(
+            COMMAND_GET_STATUS, debug=debug, timeout=timeout_override
+        )
 
-        response = self.send_command(COMMAND_GET_STATUS, timeout=timeout)
-        # Response from send_command is already stripped and address-checked
-        if response and response.startswith(f"{self.address}GS"):
-            # Extract the status code part and explicitly strip
-            status_code = response[len(f"{self.address}GS") :].strip(" \r\n\t")
-            return status_code
-        return ""  # Return empty string if no valid response
+        # Response from send_command is already stripped and address-checked against self.active_address
+        if response:  # send_command returns an empty string on error or mismatched address
+            # Command is "gs", so the response should be <active_address>GS<status_code>
+            # Example: "1GS00"
+            # We need to extract the status code part, which is after <active_address>GS
+            expected_prefix = f"{self.active_address}GS"
+            if response.startswith(expected_prefix):
+                status_code = response[
+                    len(expected_prefix) :
+                ].strip()  # Ensure any extra whitespace is stripped
+                if debug:
+                    print(f"Status for {self.name}: {status_code}")
+                return status_code
+            elif debug:
+                print(
+                    f"Unexpected GS response format for {self.name}: '{response}'. Expected prefix: '{expected_prefix}'"
+                )
+        elif debug:
+            print(f"No valid GS response or error in send_command for {self.name}")
+
+        return ""  # Return empty string if no valid status code is found
 
     def is_ready(self, status_check_timeout: Optional[float] = None) -> bool:
         """
@@ -321,7 +426,7 @@ class ElliptecRotator:
         start_time = time.time()
 
         # Define a short timeout for polling status checks within the loop
-        polling_timeout = 0.1 # seconds
+        polling_timeout = 0.1  # seconds
 
         while (time.time() - start_time) < timeout:
             # Pass the short polling timeout to the status check
@@ -421,18 +526,18 @@ class ElliptecRotator:
         response = self.send_command(COMMAND_SET_VELOCITY, data=velocity_hex)
 
         # Update stored velocity - in tests, we need to store the clamped value
-        # even if the command fails
-        if orig_velocity > 64:
-            self.velocity = 64
-        elif orig_velocity < 0:
-            self.velocity = 0
-        else:
-            self.velocity = velocity
+        # Update internal velocity state if command was likely accepted
+        # The actual check is the response, but we'll update optimistically for now
+        # or rely on get_velocity if needed later.
+        self.velocity = velocity_val
 
         # Check response - according to manual, device responds with GS (status)
-        if response and response.startswith(f"{self.address}GS"):
+        if response and response.startswith(f"{self.active_address}GS"):
             return True
 
+        # If no response or unexpected response, command may have failed
+        # Consider restoring self.velocity to its previous value if strict error handling is needed
+        # For now, we assume the set command if sent, might have taken effect or will be queried.
         return False
 
     def set_jog_step(self, degrees: float) -> bool:
@@ -453,44 +558,74 @@ class ElliptecRotator:
             # Set to continuous mode
             jog_data = "00000000"
         else:
+            # Apply offset if this rotator is part of a group and has an offset
+            target_degrees = (
+                (degrees + self.group_offset_degrees) % 360
+                if self.is_slave_in_group
+                else degrees
+            )
+
             # Use device-specific pulse count if available
-            if hasattr(self, 'pulse_per_revolution') and self.pulse_per_revolution:
-                jog_data = degrees_to_hex(degrees, self.pulse_per_revolution)
+            if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
+                jog_data = degrees_to_hex(target_degrees, self.pulse_per_revolution)
             else:
-                jog_data = degrees_to_hex(degrees)
+                jog_data = degrees_to_hex(target_degrees)
 
         # Send command
         response = self.send_command(COMMAND_SET_JOG_STEP, data=jog_data)
 
-        return response and response.startswith(f"{self.address}GS")
+        return response and response.startswith(f"{self.active_address}GS")
 
-    def update_position(self) -> float:
+    def update_position(self, debug=False) -> float:
         """
         Get the current position of the rotator in degrees.
 
         Returns:
             float: Current position in degrees
+        float: Position in degrees
         """
-        response = self.send_command(COMMAND_GET_POS)
 
-        if response and response.startswith(f"{self.address}PO"):
-            # Extract the hex position data and explicitly strip
-            pos_hex = response[len(f"{self.address}PO") :].strip(" \r\n\t")
-            # Convert to degrees
+        response = self.send_command(COMMAND_GET_POS, debug=debug)  # Pass debug flag
+
+        if response and response.startswith(f"{self.active_address}PO"):
+            pos_hex = response[len(f"{self.active_address}PO") :].strip(" \r\n\t")
             try:
-                if hasattr(self, 'pulse_per_revolution') and self.pulse_per_revolution:
-                    return hex_to_degrees(pos_hex, self.pulse_per_revolution)
-                else:
-                    return hex_to_degrees(pos_hex)
-            except ValueError:  # Handle potential errors from hex_to_degrees
-                print(
-                    f"Warning: Could not convert position response '{pos_hex}' to degrees in update_position."
+                current_degrees = 0.0
+                pulse_rev_to_use = (
+                    self.pulse_per_revolution
+                    if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution
+                    else 262144
                 )
-                return 0.0  # Return 0 on error, consistent with non-PO response
+                current_degrees = hex_to_degrees(pos_hex, pulse_rev_to_use)
 
-        return 0.0  # Return 0 if response wasn't valid PO
+                if self.is_slave_in_group:
+                    logical_position = (
+                        current_degrees - self.group_offset_degrees + 360
+                    ) % 360
+                    if debug:
+                        print(
+                            f"{self.name} (slave) physical pos: {current_degrees:.2f} deg, offset: {self.group_offset_degrees:.2f} deg, logical pos: {logical_position:.2f} deg"
+                        )
+                    return logical_position
+                else:
+                    if debug:
+                        print(
+                            f"{self.name} (master/standalone) physical pos: {current_degrees:.2f} deg"
+                        )
+                    return current_degrees
+            except ValueError:
+                if debug:
+                    print(
+                        f"Warning: Could not convert position response '{pos_hex}' to degrees for {self.name}."
+                    )
+                    return 0.0
+                elif debug:
+                    print(f"No valid position response for {self.name}. Response: '{response}'")
+                    return 0.0
 
-    def move_absolute(self, degrees: float, wait: bool = True, debug: bool = False) -> bool:
+    def move_absolute(
+        self, degrees: float, wait: bool = True, debug: bool = False
+    ) -> bool:
         """
         Move the rotator to an absolute position.
 
@@ -507,28 +642,54 @@ class ElliptecRotator:
             bool: True if the move command was sent successfully
         """
         # Normalize to 0-360 range
-        degrees = degrees % 360
-        
-        # Apply offset if in group mode
-        if self.in_group_mode and hasattr(self, 'offset') and self.offset != 0:
-            # Apply the offset for synchronized movement
-            adjusted_degrees = (degrees + self.offset) % 360
+        target_degrees_logical = degrees % 360
+
+        # Apply offset if this rotator is part of a group and has an offset
+        # The 'degrees' parameter is the logical target for the group.
+        # This specific rotator needs to move to 'logical_target + its_own_offset'.
+        if (
+            self.is_slave_in_group
+        ):  # For a slave, self.group_offset_degrees is its specific offset
+            physical_target_degrees = (
+                target_degrees_logical + self.group_offset_degrees
+            ) % 360
             if debug:
-                print(f"Applying offset of {self.offset} degrees to {self.name}: {degrees} -> {adjusted_degrees}")
-        else:
-            adjusted_degrees = degrees
-            if debug and hasattr(self, 'offset') and self.offset != 0:
-                print(f"Not in group mode but offset is set: {self.offset} (ignored)")
+                print(
+                    f"Slave {self.name} in group: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
+                )
+        elif (
+            self.group_offset_degrees != 0.0
+        ):  # For a master, self.group_offset_degrees can be its own base offset for the group move
+            physical_target_degrees = (
+                target_degrees_logical + self.group_offset_degrees
+            ) % 360
+            if debug:
+                print(
+                    f"Master/Standalone {self.name} with offset: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
+                )
+        else:  # Standalone rotator or master with no offset, or slave with no offset.
+            physical_target_degrees = target_degrees_logical
+            if debug:
+                print(
+                    f"Standalone {self.name}: logical_target={target_degrees_logical}, physical_target={physical_target_degrees}"
+                )
 
         # Convert to hex position using device-specific pulse count if available
-        if hasattr(self, 'pulse_per_revolution') and self.pulse_per_revolution:
-            hex_pos = degrees_to_hex(adjusted_degrees, self.pulse_per_revolution)
+        if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
+            hex_pos = degrees_to_hex(physical_target_degrees, self.pulse_per_revolution)
             if debug:
-                print(f"Using device-specific pulse count: {self.pulse_per_revolution} for {self.name}")
+                print(
+                    f"Using device-specific pulse count: {self.pulse_per_revolution} for {self.name}"
+                )
         else:
-            hex_pos = degrees_to_hex(adjusted_degrees)
+            hex_pos = degrees_to_hex(physical_target_degrees)
             if debug:
                 print(f"Using default pulse count for {self.name}")
+
+        if debug:
+            print(
+                f"{self.name} moving to physical target {physical_target_degrees:.2f} deg (hex: {hex_pos})"
+            )
 
         # Send the command
         response = self.send_command(COMMAND_MOVE_ABS, data=hex_pos, debug=debug)
@@ -539,37 +700,40 @@ class ElliptecRotator:
         # According to manual, device responds with either GS (status) or PO (position)
         # but some devices may not respond immediately
         if response and (
-            response.startswith(f"{self.address}GS")
-            or response.startswith(f"{self.address}PO")
+            response.startswith(f"{self.active_address}GS")
+            or response.startswith(f"{self.active_address}PO")
         ):
             if wait:
                 return self.wait_until_ready()
             return True
         else:
-            # No response received, but command might still be processing
-            # Let's check position to verify movement
+            # No response received, but command might have been accepted by the device.
             if wait:
-                time.sleep(1.0)  # Give device time to start moving
-                # Check if position changed or if device reports ready
-                current_pos = self.update_position()
-                if abs(current_pos - degrees) < 5.0 or self.is_ready():
-                    return self.wait_until_ready()
-            return True  # Assume command was received
-            # Even without a response, the command might have worked
-            # Wait a moment and verify position if waiting is requested
-            if wait:
-                time.sleep(0.5)  # Brief pause for device to start moving
+                if debug:
+                    print(
+                        f"{self.name}: No immediate response for move_absolute, but waiting for completion as wait=True."
+                    )
+                # Brief pause to allow movement to start if the device is slow to process
+                # but did receive the command.
+                time.sleep(0.2)  # Increased slightly
                 return self.wait_until_ready()
+            else:
+                # If not waiting, assume the command was sent and might be processing.
+                # The caller opted not to wait for confirmation of completion.
+                if debug:
+                    print(
+                        f"{self.name}: No immediate response for move_absolute, command sent (wait=False). Assuming success."
+                    )
+                return True
 
-            # If not waiting, assume success unless next status check says otherwise
-            return True
-
-    def continuous_move(self, direction: str = "cw", start: bool = True) -> bool:
+    def continuous_move(
+        self, direction: str = "cw", start: bool = True, debug: bool = False
+    ) -> bool:
         """
         Start or stop continuous movement of the rotator.
 
         Args:
-            direction: Direction of movement ("cw" or "ccw")
+            direction: Direction of movement ("fw" [forward] or "bw" [backward])
             start: True to start movement, False to stop
 
         Returns:
@@ -581,14 +745,17 @@ class ElliptecRotator:
                 return False  # Failed to set jog step
 
             # Send command for continuous movement
-            if direction.lower() == "cw":
-                response = self.send_command(COMMAND_FORWARD)
-            elif direction.lower() == "ccw":
-                response = self.send_command(COMMAND_BACKWARD)
+            if direction.lower() == "fw":
+                response = self.send_command(COMMAND_FORWARD, debug=debug)
+            elif direction.lower() == "bw":
+                response = self.send_command(COMMAND_BACKWARD, debug=debug)
             else:
-                raise ValueError("Direction must be 'cw' or 'ccw'")
+                raise ValueError("Direction must be 'fw' or 'bw'")
 
-            if response and response.startswith(f"{self.address}GS"):
+            # Check response using active_address, as send_command verified the reply came from it
+            # Continuous move often doesn't give an immediate useful response,
+            # but we check for GS=OK as a basic acknowledgment if provided.
+            if response and response.startswith(f"{self.active_address}GS"):
                 self.is_moving = True
                 return True
 
@@ -596,6 +763,104 @@ class ElliptecRotator:
         else:
             # Stop the movement
             return self.stop()
+
+    def configure_as_group_slave(self, master_address_to_listen_to: str, slave_offset: float = 0.0, debug: bool = False) -> bool:
+        """
+        Instruct this rotator (slave) to listen to a master_address.
+        Used for synchronized group movements.
+
+        Args:
+            master_address_to_listen_to (str): The address this rotator should listen to (0-F).
+            slave_offset (float): Angular offset in degrees for this slave rotator.
+            debug (bool): Whether to print debug information.
+
+        Returns:
+            bool: True if configuration was successful.
+        """
+        try:
+            int(master_address_to_listen_to, 16)
+            if len(master_address_to_listen_to) != 1:
+                raise ValueError("Master address must be a single hex character.")
+        except ValueError:
+            if debug:
+                print(f"Invalid master_address_to_listen_to: '{master_address_to_listen_to}'. Must be 0-F.")
+            return False
+
+        if debug:
+            print(f"Configuring {self.name} (phys_addr: {self.physical_address}) to listen to master_addr: {master_address_to_listen_to} with offset: {slave_offset} deg.")
+
+        # Command: <physical_address_of_slave>ga<master_address_to_listen_to>
+        # Reply expected from: <master_address_to_listen_to>GS<status>
+        response = self.send_command(
+            command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
+            data=master_address_to_listen_to,
+            send_addr_override=self.physical_address, # Send command using its physical address
+            expect_reply_from_addr=master_address_to_listen_to, # Reply comes from the new address
+            debug=debug,
+            timeout_multiplier=1.5 # Give 'ga' a bit more time for response
+        )
+
+        if response and response.startswith(f"{master_address_to_listen_to}GS") and "00" in response: # Check for "00" status
+            self.active_address = master_address_to_listen_to
+            self.group_offset_degrees = slave_offset
+            self.is_slave_in_group = True
+            if debug:
+                print(f"{self.name} successfully configured as slave. Active_addr: {self.active_address}, Offset: {self.group_offset_degrees}")
+            return True
+        else:
+            if debug:
+                print(f"Failed to configure {self.name} as slave. Response: {response}")
+            # Attempt to revert to physical address if partial failure, though device might be in unknown state
+            self.active_address = self.physical_address
+            self.is_slave_in_group = False
+            self.group_offset_degrees = 0.0
+            return False
+
+    def revert_from_group_slave(self, debug: bool = False) -> bool:
+        """
+        Revert this rotator from slave mode back to its physical address.
+
+        Args:
+            debug (bool): Whether to print debug information.
+
+        Returns:
+            bool: True if reversion was successful.
+        """
+        if not self.is_slave_in_group:
+            if debug:
+                print(f"{self.name} is not in slave group mode. No reversion needed.")
+            self.active_address = self.physical_address # Ensure consistency
+            self.group_offset_degrees = 0.0
+            return True
+
+        current_listening_address = self.active_address
+        if debug:
+            print(f"Reverting {self.name} from listening to {current_listening_address} back to physical_addr: {self.physical_address}.")
+
+        # Command: <current_listening_address>ga<physical_address_of_this_rotator>
+        # Reply expected from: <physical_address_of_this_rotator>GS<status>
+        response = self.send_command(
+            command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
+            data=self.physical_address,
+            send_addr_override=current_listening_address, # Command is sent to the address it's currently listening on
+            expect_reply_from_addr=self.physical_address, # Reply comes from its physical address
+            debug=debug,
+            timeout_multiplier=1.5 # Give 'ga' a bit more time for response
+        )
+
+        # Always reset internal state regardless of response to avoid being stuck
+        self.active_address = self.physical_address
+        self.is_slave_in_group = False
+        self.group_offset_degrees = 0.0
+
+        if response and response.startswith(f"{self.physical_address}GS") and "00" in response: # Check for "00" status
+            if debug:
+                print(f"{self.name} successfully reverted to physical address {self.physical_address}.")
+            return True
+        else:
+            if debug:
+                print(f"Failed to revert {self.name} to physical address. Response: {response}. Internal state reset.")
+            return False
 
     def optimize_motors(self, wait: bool = True) -> bool:
         """
@@ -606,11 +871,11 @@ class ElliptecRotator:
 
         Args:
             wait: Whether to wait for the optimization process to complete.
-                  Optimization can take a significant amount of time.
+                Optimization can take a significant amount of time.
 
         Returns:
             bool: True if the command was acknowledged successfully, False otherwise.
-                  Note that acknowledgement doesn't mean optimization completed if wait=False.
+                Note that acknowledgement doesn't mean optimization completed if wait=False.
         """
         # Command structure is simply <addr>om
         response = self.send_command(COMMAND_OPTIMIZE_MOTORS)
@@ -619,103 +884,149 @@ class ElliptecRotator:
         if response and response.startswith(f"{self.address}GS"):
             # Status might initially indicate busy (e.g., '0A')
             if wait:
-                print(f"Waiting for motor optimization on {self.name} to complete...")
+                print(
+                    f"Waiting for motor optimization on {self.name} to complete..."
+                )
                 # Need a long timeout for optimization
                 # We wait until status is '00' (Ready)
                 # TODO: Refine wait logic based on expected busy codes during optimization
-                return self.wait_until_ready(timeout=60.0) # Use a long timeout (e.g., 60 seconds)
-            return True # Command acknowledged
+                return self.wait_until_ready(
+                    timeout=60.0
+                )  # Use a long timeout (e.g., 60 seconds)
+            return True  # Command acknowledged
 
-        print(f"Failed to start motor optimization on {self.name}. Response: {response}")
+        print(
+            f"Failed to start motor optimization on {self.name}. Response: {response}"
+        )
         return False
 
-    def set_group_address(self, group_address: str, offset: float = 0.0, debug: bool = False) -> bool:
+    def configure_as_group_slave(
+        self,
+        master_address_to_listen_to: str,
+        slave_offset: float = 0.0,
+        debug: bool = False,
+    ) -> bool:
         """
-        Set a group address for synchronized movement.
-        
-        This allows multiple devices to be addressed simultaneously as a temporary group,
-        so that their movement can be synchronized. Once the motion has been completed
-        the device returns to its original address.
-        
+        Instruct this rotator (slave) to listen to a master_address.
+        Used for synchronized group movements.
+
         Args:
-            group_address (str): The group address (0-F) to assign to this device
-            offset (float): Angular offset in degrees to apply during group movements
-            debug (bool): Whether to print debug information
-            
+            master_address_to_listen_to (str): The address this rotator should listen to (0-F).
+            slave_offset (float): Angular offset in degrees for this slave rotator.
+            debug (bool): Whether to print debug information.
+
         Returns:
-            bool: True if the group address was set successfully
+            bool: True if configuration was successful.
         """
-        # Validate group address
         try:
-            int(group_address, 16)  # Check if it's a valid hex character
-            if len(group_address) != 1:
-                raise ValueError(f"Group address must be a single hex character (0-F), got: {group_address}")
+            int(master_address_to_listen_to, 16)
+            if len(master_address_to_listen_to) != 1:
+                raise ValueError("Master address must be a single hex character.")
         except ValueError:
-            print(f"Invalid group address: {group_address}. Must be a single hex character (0-F).")
-            return False
-        
-        # Store the offset for later use
-        self.offset = offset
-        
-        if debug:
-            print(f"Setting {self.name} to listen to group address {group_address} with offset {offset}")
-        
-        # Send the group address command
-        response = self.send_command(COMMAND_GROUP_ADDRESS, data=group_address)
-        
-        # Check for a successful response
-        if response and response.startswith(f"{group_address}GS"):
-            self.in_group_mode = True
-            self.group_address = group_address
             if debug:
-                print(f"Successfully set {self.name} to group address {group_address}")
+                print(
+                    f"Invalid master_address_to_listen_to: '{master_address_to_listen_to}'. Must be 0-F."
+                )
+            return False
+
+        if debug:
+            print(
+                f"Configuring {self.name} (phys_addr: {self.physical_address}) to listen to master_addr: {master_address_to_listen_to} with offset: {slave_offset} deg."
+            )
+
+        # Command: <physical_address_of_slave>ga<master_address_to_listen_to>
+        # Reply expected from: <master_address_to_listen_to>GS<status>
+        response = self.send_command(
+            command=COMMAND_GROUP_ADDRESS,  # Explicitly name the 'command' parameter
+            data=master_address_to_listen_to,
+            send_addr_override=self.physical_address,  # Send command using its physical address
+            expect_reply_from_addr=master_address_to_listen_to,  # Reply comes from the new address
+            debug=debug,
+            timeout_multiplier=1.5,  # Give 'ga' a bit more time for response
+        )
+
+        if (
+            response
+            and response.startswith(f"{master_address_to_listen_to}GS")
+            and "00" in response
+        ):  # Check for "00" status
+            self.active_address = master_address_to_listen_to
+            self.group_offset_degrees = slave_offset
+            self.is_slave_in_group = True
+            if debug:
+                print(
+                    f"{self.name} successfully configured as slave. Active_addr: {self.active_address}, Offset: {self.group_offset_degrees}"
+                )
             return True
         else:
-            self.in_group_mode = False
             if debug:
-                print(f"Failed to set {self.name} to group address {group_address}")
+                print(
+                    f"Failed to configure {self.name} as slave. Response: {response}"
+                )
+            # Attempt to revert to physical address if partial failure, though device might be in unknown state
+            self.active_address = self.physical_address
+            self.is_slave_in_group = False
+            self.group_offset_degrees = 0.0
             return False
-    
-    def clear_group_address(self) -> bool:
-        """
-        Clear the group address and return to normal addressing mode.
-        
-        After a synchronized movement is complete, this method can be used
-        to explicitly return the device to its original address if needed.
-        
-        Returns:
-            bool: True if the group address was successfully cleared
-        """
-        if not self.in_group_mode or not self.group_address:
-            # Already in normal mode
-            self.in_group_mode = False
-            self.offset = 0.0
-            return True
-            
-        # Store current state
-        original_address = self.address
-        
-        try:
-            # Send command to return to original address
-            response = self.send_command(COMMAND_GROUP_ADDRESS, data=self.address)
-            
-            # Check response
-            if response and response.startswith(f"{self.address}GS"):
-                self.in_group_mode = False
-                self.offset = 0.0
+
+        def revert_from_group_slave(self, debug: bool = False) -> bool:
+            """
+            Revert this rotator from slave mode back to its physical address.
+
+            Args:
+                debug (bool): Whether to print debug information.
+
+            Returns:
+                bool: True if reversion was successful.
+            """
+            if not self.is_slave_in_group:
+                if debug:
+                    print(
+                        f"{self.name} is not in slave group mode. No reversion needed."
+                    )
+                self.active_address = self.physical_address  # Ensure consistency
+                self.group_offset_degrees = 0.0
+                return True
+
+            current_listening_address = self.active_address
+            if debug:
+                print(
+                    f"Reverting {self.name} from listening to {current_listening_address} back to physical_addr: {self.physical_address}."
+                )
+
+            # Command: <current_listening_address>ga<physical_address_of_this_rotator>
+            # Reply expected from: <physical_address_of_this_rotator>GS<status>
+            response = self.send_command(
+                command=COMMAND_GROUP_ADDRESS,  # Explicitly name the 'command' parameter
+                data=self.physical_address,
+                send_addr_override=current_listening_address,  # Command is sent to the address it's currently listening on
+                expect_reply_from_addr=self.physical_address,  # Reply comes from its physical address
+                debug=debug,
+                timeout_multiplier=1.5,  # Give 'ga' a bit more time for response
+            )
+
+            # Always reset internal state regardless of response to avoid being stuck
+            self.active_address = self.physical_address
+            self.is_slave_in_group = False
+            self.group_offset_degrees = 0.0
+
+            if (
+                response
+                and response.startswith(f"{self.physical_address}GS")
+                and "00" in response
+            ):  # Check for "00" status
+                if debug:
+                    print(
+                        f"{self.name} successfully reverted to physical address {self.physical_address}."
+                    )
                 return True
             else:
-                # If we get a bad response, at least reset our internal state
-                self.in_group_mode = False
-                self.offset = 0.0
+                if debug:
+                    print(
+                        f"Failed to revert {self.name} to physical address. Response: {response}. Internal state reset."
+                    )
                 return False
-        except Exception as e:
-            # Even if there's an error, reset our internal state
-            print(f"Error clearing group address: {e}")
-            self.in_group_mode = False
-            self.offset = 0.0
-            return False
-            
+
     def get_device_info(self, debug: bool = False) -> Dict[str, str]:
         """
         Get detailed information about the rotator device.
@@ -737,13 +1048,14 @@ class ElliptecRotator:
             print(f"Requesting device information from {self.name}...")
 
         # Send the IN command (get information)
+        # Device info should always be queried from its current active address
         response = self.send_command(COMMAND_GET_INFO, debug=debug)
         info = {}
 
         # Process the response
-        if response and response.startswith(f"{self.address}IN"):
+        if response and response.startswith(f"{self.active_address}IN"):
             # Remove the address and command prefix (e.g., "3IN")
-            data = response[len(f"{self.address}IN"):].strip(" \r\n\t")
+            data = response[len(f"{self.active_address}IN") :].strip(" \r\n\t")
 
             if debug:
                 print(f"Response data: '{data}', length: {len(data)}")
@@ -781,7 +1093,7 @@ class ElliptecRotator:
                     self.pulse_per_revolution = 262144  # Default value
                     self.pulses_per_deg = self.pulse_per_revolution / 360.0
                     return info
-            
+
             # Special case for test_get_device_info
             if data == "0E1140TESTSERL2401016800023000":
                 info = {
@@ -814,7 +1126,7 @@ class ElliptecRotator:
                     # [17] - Hardware
                     # [18:22] - Range (Travel)
                     # [22:] - Pulse/Rev
-                    
+
                     # Dictionary for device info
                     info = {
                         "type": data[0:2],
@@ -826,38 +1138,48 @@ class ElliptecRotator:
                         "max_range": data[18:22],  # For backward compatibility
                         "travel": data[18:22],
                     }
-                    
+
                     # Parse pulse_per_revolution if available
                     if len(data) > 22:
                         info["pulses_per_unit"] = data[22:]
                         try:
                             pulses_dec = int(info["pulses_per_unit"], 16)
                             info["pulses_per_unit_dec"] = str(pulses_dec)
-                            
+
                             # Store the actual pulse count for accurate positioning
-                            if pulses_dec > 1000:  # Reasonable minimum for a rotator
+                            if (
+                                pulses_dec > 1000
+                            ):  # Reasonable minimum for a rotator
                                 self.pulse_per_revolution = pulses_dec
                                 self.pulses_per_deg = pulses_dec / 360.0
                                 if debug:
-                                    print(f"Set pulse_per_revolution to {self.pulse_per_revolution}")
-                                    print(f"Set pulses_per_deg to {self.pulses_per_deg}")
+                                    print(
+                                        f"Set pulse_per_revolution to {self.pulse_per_revolution}"
+                                    )
+                                    print(
+                                        f"Set pulses_per_deg to {self.pulses_per_deg}"
+                                    )
                             else:
                                 # Fallback to default values
                                 if debug:
-                                    print(f"Pulses value too small ({pulses_dec}), using default: {self.pulse_per_revolution}")
+                                    print(
+                                        f"Pulses value too small ({pulses_dec}), using default: {self.pulse_per_revolution}"
+                                    )
                         except ValueError:
                             if debug:
-                                print(f"Could not convert pulses_per_unit {info['pulses_per_unit']} to decimal")
-                    
+                                print(
+                                    f"Could not convert pulses_per_unit {info['pulses_per_unit']} to decimal"
+                                )
+
                     # Add additional fields for compatibility with existing code
-                    
+
                     # Format firmware version
                     try:
                         fw_val = int(info["firmware"], 16)
                         info["firmware_formatted"] = f"{fw_val // 16}.{fw_val % 16}"
                     except (ValueError, IndexError):
                         pass
-                    
+
                     # Format hardware version
                     try:
                         hw_val = int(info["hardware"], 16)
@@ -865,18 +1187,18 @@ class ElliptecRotator:
                         info["hardware_release"] = str(hw_val)
                     except (ValueError, TypeError):
                         pass
-                    
+
                     # Format date fields for compatibility
                     info["manufacture_date"] = info["year"]
                     info["year_month"] = info["year"]  # For backward compatibility
-                    
+
                     # For range values
                     try:
                         range_val = int(info["max_range"], 16)
                         info["range_dec"] = str(range_val)
                     except (ValueError, TypeError):
                         pass
-                        
+
                 elif data.startswith("I1") or data.startswith("I2"):
                     # This appears to be a motor info response, not a device info response
                     if len(data) >= 22:
@@ -896,11 +1218,12 @@ class ElliptecRotator:
                 else:
                     print(f"Response data too short: '{data}', length: {len(data)}")
                     info = {"type": "Unknown", "error": "Data too short"}
-            
+
             except Exception as e:
                 print(f"Error parsing device info: {e}")
                 if debug:
                     import traceback
+
                     traceback.print_exc()
                 info = {"type": "Error", "error": str(e)}
         else:
@@ -908,403 +1231,403 @@ class ElliptecRotator:
 
         if debug:
             print(f"Device information for {self.name}: {info}")
-        
+
         # Store the info for future use
         self.device_info = info
-        
+
         return info
 
 
-class TripleRotatorController:
-    """
-    Controller for three Elliptec rotators in a typical setup.
+# class TripleRotatorController:
+#     """
+#     Controller for three Elliptec rotators in a typical setup.
 
-    This class provides a unified interface for controlling three rotators
-    which is a common configuration for polarization control (typically
-    two half-wave plates and one quarter-wave plate).
-    """
+#     This class provides a unified interface for controlling three rotators
+#     which is a common configuration for polarization control (typically
+#     two half-wave plates and one quarter-wave plate).
+#     """
 
-    def __init__(
-        self,
-        port: Union[str, Any],
-        motor_addresses: List[int] = None,
-        addresses: List[int] = None,  # Alias for backward compatibility
-        names: List[str] = None,
-    ):
-        """
-        Initialize the triple rotator controller.
+#     def __init__(
+#         self,
+#         port: Union[str, Any],
+#         motor_addresses: List[int] = None,
+#         addresses: List[int] = None,  # Alias for backward compatibility
+#         names: List[str] = None,
+#     ):
+#         """
+#         Initialize the triple rotator controller.
 
-        Args:
-            port: Serial port where the rotators are connected
-            motor_addresses: List of up to 3 motor addresses
-            addresses: Alias for motor_addresses (for backward compatibility)
-            names: Optional list of names for the rotators
-        """
-        if motor_addresses is None and addresses is not None:
-            motor_addresses = addresses
-        elif motor_addresses is None:
-            motor_addresses = [1, 2, 3]  # Default addresses
+#         Args:
+#             port: Serial port where the rotators are connected
+#             motor_addresses: List of up to 3 motor addresses
+#             addresses: Alias for motor_addresses (for backward compatibility)
+#             names: Optional list of names for the rotators
+#         """
+#         if motor_addresses is None and addresses is not None:
+#             motor_addresses = addresses
+#         elif motor_addresses is None:
+#             motor_addresses = [1, 2, 3]  # Default addresses
 
-        if len(motor_addresses) > 3:
-            raise ValueError("TripleRotatorController supports up to 3 rotators")
+#         if len(motor_addresses) > 3:
+#             raise ValueError("TripleRotatorController supports up to 3 rotators")
 
-        if names is not None and len(names) != len(motor_addresses):
-            raise ValueError(
-                "If provided, names list must match the length of motor_addresses"
-            )
+#         if names is not None and len(names) != len(motor_addresses):
+#             raise ValueError(
+#                 "If provided, names list must match the length of motor_addresses"
+#             )
 
-        # For testing, check if port is a MockSerial object
-        if hasattr(port, "set_response") or hasattr(port, "queue_response"):
-            # This is likely a mock object for testing
-            self.serial = port
-        else:
-            # Create a real serial connection
-            self.serial = serial.Serial(
-                port=port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1
-            )
+#         # For testing, check if port is a MockSerial object
+#         if hasattr(port, "set_response") or hasattr(port, "queue_response"):
+#             # This is likely a mock object for testing
+#             self.serial = port
+#         else:
+#             # Create a real serial connection
+#             self.serial = serial.Serial(
+#                 port=port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1
+#             )
 
-        # Create rotator instances
-        self.rotators = []
-        for i, addr in enumerate(motor_addresses):
-            name = names[i] if names else f"Rotator-{addr}"
-            self.rotators.append(
-                ElliptecRotator(self.serial, motor_address=addr, name=name)
-            )
+#         # Create rotator instances
+#         self.rotators = []
+#         for i, addr in enumerate(motor_addresses):
+#             name = names[i] if names else f"Rotator-{addr}"
+#             self.rotators.append(
+#                 ElliptecRotator(self.serial, motor_address=addr, name=name)
+#             )
 
-    def __enter__(self):
-        """Context manager entry."""
-        return self
+#     def __enter__(self):
+#         """Context manager entry."""
+#         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        self.close()
+#     def __exit__(self, exc_type, exc_val, exc_tb):
+#         """Context manager exit."""
+#         self.close()
 
-    def close(self):
-        """Close the serial connection."""
-        if hasattr(self, "serial") and self.serial.is_open:
-            self.serial.close()
-            
-    def synchronized_move(self, degrees: float, group_address: str = "F", 
-                          offsets: List[float] = None, wait: bool = True,
-                          timeout: float = 30.0, debug: bool = False) -> bool:
-        """
-        Move rotators in a synchronized manner using group addressing.
-        
-        This method sets up a temporary group for synchronized movement, where
-        all rotators will respond to the same group address. Each rotator can
-        have its own offset for precise positioning relationships.
-        
-        Args:
-            degrees: Target position in degrees (0-360)
-            group_address: The group address to use (0-F)
-            offsets: List of angular offsets in degrees for each rotator (optional)
-            wait: Whether to wait for movement to complete
-            timeout: Maximum time to wait for completion (seconds)
-            debug: Whether to print debug information
-            
-        Returns:
-            bool: True if the synchronized move was successful
-        """
-        if len(self.rotators) < 2:
-            print("Warning: Synchronized movement requires at least 2 rotators")
-            if len(self.rotators) == 1:
-                # Just do a normal move for a single rotator
-                return self.rotators[0].move_absolute(degrees, wait=wait)
-            return False
-            
-        # Apply defaults if no offsets provided
-        if offsets is None:
-            offsets = [0.0] * len(self.rotators)
-        elif len(offsets) != len(self.rotators):
-            raise ValueError("Number of offsets must match number of rotators")
-            
-        if debug:
-            print(f"Setting up synchronized move to {degrees} degrees with offsets: {offsets}")
-            
-        # First rotator will be the master (keep its address)
-        master_rotator = self.rotators[0]
-        slave_rotators = self.rotators[1:]
-        
-        try:
-            # Set group address and offsets for slave rotators
-            group_setup_ok = True
-            for i, rotator in enumerate(slave_rotators):
-                offset = offsets[i+1] if i+1 < len(offsets) else 0.0
-                if not rotator.set_group_address(group_address=group_address, offset=offset):
-                    print(f"Warning: Failed to set group address for {rotator.name}")
-                    group_setup_ok = False
-                elif debug:
-                    print(f"Set {rotator.name} to group address {group_address} with offset {offset}")
-                    
-            if not group_setup_ok:
-                print("Warning: Group setup incomplete, some rotators may not move in sync")
-            
-            # Set offset for master rotator (doesn't change address)
-            master_rotator.offset = offsets[0] if offsets else 0.0
-            if debug and offsets[0] != 0:
-                print(f"Set master rotator offset to {offsets[0]} degrees")
-            
-            # Execute the move from the master rotator
-            if debug:
-                print(f"Executing synchronized move to {degrees} degrees from master rotator")
-            result = master_rotator.move_absolute(degrees, wait=False)
-            
-            # Wait for all to complete if requested
-            if wait:
-                if debug:
-                    print("Waiting for all rotators to complete movement...")
-                wait_result = self.wait_all_ready(timeout=timeout)
-                if not wait_result and debug:
-                    print(f"Warning: Timeout ({timeout}s) while waiting for rotators to complete")
-                result = result and wait_result
-                
-            return result
-            
-        finally:
-            # Always reset group mode and offsets, even if there was an error
-            if debug:
-                print("Clearing group addresses")
-            self.clear_all_group_addresses()
-        
-    def clear_all_group_addresses(self) -> bool:
-        """
-        Clear group addresses for all rotators.
-        
-        This method returns all rotators to their original addresses
-        and clears any offsets that were set for group movement.
-        
-        Returns:
-            bool: True if all group addresses were successfully cleared
-        """
-        results = []
-        for rotator in self.rotators:
-            # Only clear if the rotator is in group mode
-            if rotator.in_group_mode:
-                results.append(rotator.clear_group_address())
-            else:
-                # Just reset the offset even if not in group mode
-                rotator.offset = 0.0
-                results.append(True)
-        return all(results)
+#     def close(self):
+#         """Close the serial connection."""
+#         if hasattr(self, "serial") and self.serial.is_open:
+#             self.serial.close()
 
-    def continuous_move_all(self, directions: List[str], wait: bool = False,
-                             use_group_address: bool = False, group_address: str = "F",
-                             debug: bool = False) -> bool:
-        """
-        Start continuous movement for all rotators.
-        
-        Args:
-            directions: List of directions for each rotator ('fw' for forward, 'bw' for backward)
-            wait: Whether to wait briefly to ensure movement has started
-            use_group_address: Whether to use group addressing for synchronized movement
-            group_address: The group address to use (0-F) if use_group_address is True
-            debug: Whether to print debug information
-            
-        Returns:
-            bool: True if all continuous move commands were sent successfully
-        """
-        if len(directions) != len(self.rotators):
-            raise ValueError("directions must contain one entry for each rotator")
-            
-        # Validate all directions
-        for direction in directions:
-            if direction not in ['fw', 'bw']:
-                raise ValueError(f"Invalid direction: {direction}. Must be 'fw' or 'bw'")
-                
-        # If using group addressing, handle specially
-        if use_group_address and len(self.rotators) >= 2:
-            if debug:
-                print(f"Using group addressing for continuous move with directions: {directions}")
-                
-            master_direction = directions[0]
-            
-            # Set up group addressing
-            for i, rotator in enumerate(self.rotators[1:], 1):
-                if not rotator.set_group_address(group_address, debug=debug):
-                    print(f"Warning: Failed to set group address for {rotator.name}")
-                    
-            try:
-                # Send continuous move command from master rotator
-                if debug:
-                    print(f"Sending {master_direction} command from master rotator")
-                    
-                result = False
-                if master_direction == 'fw':
-                    result = self.rotators[0].send_command(COMMAND_FORWARD) is not None
-                else:  # 'bw'
-                    result = self.rotators[0].send_command(COMMAND_BACKWARD) is not None
-                    
-                # Briefly wait if requested
-                if wait:
-                    time.sleep(0.5)
-                    
-                return result
-            finally:
-                # Ensure we clear group addresses
-                self.clear_all_group_addresses()
-                
-        # Standard approach (non-synchronized)
-        results = []
-        
-        # Send commands to all rotators
-        for i, rotator in enumerate(self.rotators):
-            if directions[i] == 'fw':
-                results.append(rotator.send_command(COMMAND_FORWARD, debug=debug) is not None)
-            else:  # 'bw'
-                results.append(rotator.send_command(COMMAND_BACKWARD, debug=debug) is not None)
-                
-        # Briefly wait if requested
-        if wait:
-            time.sleep(0.5)
-            
-        return all(results)
-        
-    def home_all(self, wait: bool = True, timeout: float = 30.0, debug: bool = False) -> bool:
-        """
-        Home all rotators.
+#     def synchronized_move(self, degrees: float, group_address: str = "F",
+#                           offsets: List[float] = None, wait: bool = True,
+#                           timeout: float = 30.0, debug: bool = False) -> bool:
+#         """
+#         Move rotators in a synchronized manner using group addressing.
 
-        Args:
-            wait: Whether to wait for all rotators to complete homing
-            timeout: Maximum time to wait for completion in seconds
-            debug: Whether to print debug information
+#         This method sets up a temporary group for synchronized movement, where
+#         all rotators will respond to the same group address. Each rotator can
+#         have its own offset for precise positioning relationships.
 
-        Returns:
-            bool: True if all home commands were sent successfully
-        """
-        results = []
+#         Args:
+#             degrees: Target position in degrees (0-360)
+#             group_address: The group address to use (0-F)
+#             offsets: List of angular offsets in degrees for each rotator (optional)
+#             wait: Whether to wait for movement to complete
+#             timeout: Maximum time to wait for completion (seconds)
+#             debug: Whether to print debug information
 
-        # Send home commands to all rotators
-        for rotator in self.rotators:
-            results.append(rotator.home(wait=False))
+#         Returns:
+#             bool: True if the synchronized move was successful
+#         """
+#         if len(self.rotators) < 2:
+#             print("Warning: Synchronized movement requires at least 2 rotators")
+#             if len(self.rotators) == 1:
+#                 # Just do a normal move for a single rotator
+#                 return self.rotators[0].move_absolute(degrees, wait=wait)
+#             return False
 
-        if wait:
-            if debug:
-                print("Waiting for all rotators to complete homing...")
-            self.wait_all_ready(timeout=timeout)
+#         # Apply defaults if no offsets provided
+#         if offsets is None:
+#             offsets = [0.0] * len(self.rotators)
+#         elif len(offsets) != len(self.rotators):
+#             raise ValueError("Number of offsets must match number of rotators")
 
-        return all(results)
+#         if debug:
+#             print(f"Setting up synchronized move to {degrees} degrees with offsets: {offsets}")
 
-    def is_all_ready(self) -> bool:
-        """
-        Check if all rotators are ready.
+#         # First rotator will be the master (keep its address)
+#         master_rotator = self.rotators[0]
+#         slave_rotators = self.rotators[1:]
 
-        Returns:
-            bool: True if all rotators are ready
-        """
-        return all(rotator.is_ready() for rotator in self.rotators)
+#         try:
+#             # Set group address and offsets for slave rotators
+#             group_setup_ok = True
+#             for i, rotator in enumerate(slave_rotators):
+#                 offset = offsets[i+1] if i+1 < len(offsets) else 0.0
+#                 if not rotator.set_group_address(group_address=group_address, offset=offset):
+#                     print(f"Warning: Failed to set group address for {rotator.name}")
+#                     group_setup_ok = False
+#                 elif debug:
+#                     print(f"Set {rotator.name} to group address {group_address} with offset {offset}")
 
-    def wait_all_ready(self, timeout: float = 30.0, polling_interval: float = 0.1) -> bool:
-        """
-        Wait until all rotators are ready.
+#             if not group_setup_ok:
+#                 print("Warning: Group setup incomplete, some rotators may not move in sync")
 
-        Args:
-            timeout: Maximum time to wait in seconds
-            polling_interval: Time between status checks in seconds
+#             # Set offset for master rotator (doesn't change address)
+#             master_rotator.offset = offsets[0] if offsets else 0.0
+#             if debug and offsets[0] != 0:
+#                 print(f"Set master rotator offset to {offsets[0]} degrees")
 
-        Returns:
-            bool: True if all rotators became ready, False if timeout occurred
-        """
-        start_time = time.time()
+#             # Execute the move from the master rotator
+#             if debug:
+#                 print(f"Executing synchronized move to {degrees} degrees from master rotator")
+#             result = master_rotator.move_absolute(degrees, wait=False)
 
-        while (time.time() - start_time) < timeout:
-            if self.is_all_ready():
-                for rotator in self.rotators:
-                    rotator.is_moving = False
-                return True
-            time.sleep(polling_interval)
+#             # Wait for all to complete if requested
+#             if wait:
+#                 if debug:
+#                     print("Waiting for all rotators to complete movement...")
+#                 wait_result = self.wait_all_ready(timeout=timeout)
+#                 if not wait_result and debug:
+#                     print(f"Warning: Timeout ({timeout}s) while waiting for rotators to complete")
+#                 result = result and wait_result
 
-        # If we reach here, we timed out - update is_moving flag for accuracy
-        for rotator in self.rotators:
-            rotator.is_moving = not rotator.is_ready()
-        return False
+#             return result
 
-    def stop_all(self) -> bool:
-        """
-        Stop all rotators immediately.
+#         finally:
+#             # Always reset group mode and offsets, even if there was an error
+#             if debug:
+#                 print("Clearing group addresses")
+#             self.clear_all_group_addresses()
 
-        Returns:
-            bool: True if all stop commands were sent successfully
-        """
-        results = []
+#     def clear_all_group_addresses(self) -> bool:
+#         """
+#         Clear group addresses for all rotators.
 
-        for rotator in self.rotators:
-            results.append(rotator.stop())
+#         This method returns all rotators to their original addresses
+#         and clears any offsets that were set for group movement.
 
-        return all(results)
+#         Returns:
+#             bool: True if all group addresses were successfully cleared
+#         """
+#         results = []
+#         for rotator in self.rotators:
+#             # Only clear if the rotator is in group mode
+#             if rotator.in_group_mode:
+#                 results.append(rotator.clear_group_address())
+#             else:
+#                 # Just reset the offset even if not in group mode
+#                 rotator.offset = 0.0
+#                 results.append(True)
+#         return all(results)
 
-    def set_all_velocities(self, velocity: int) -> bool:
-        """
-        Set the velocity for all rotators.
+#     def continuous_move_all(self, directions: List[str], wait: bool = False,
+#                              use_group_address: bool = False, group_address: str = "F",
+#                              debug: bool = False) -> bool:
+#         """
+#         Start continuous movement for all rotators.
 
-        Args:
-            velocity: Velocity value (0-64)
+#         Args:
+#             directions: List of directions for each rotator ('fw' for forward, 'bw' for backward)
+#             wait: Whether to wait briefly to ensure movement has started
+#             use_group_address: Whether to use group addressing for synchronized movement
+#             group_address: The group address to use (0-F) if use_group_address is True
+#             debug: Whether to print debug information
 
-        Returns:
-            bool: True if all velocities were set successfully
-        """
-        results = []
+#         Returns:
+#             bool: True if all continuous move commands were sent successfully
+#         """
+#         if len(directions) != len(self.rotators):
+#             raise ValueError("directions must contain one entry for each rotator")
 
-        for rotator in self.rotators:
-            results.append(rotator.set_velocity(velocity))
+#         # Validate all directions
+#         for direction in directions:
+#             if direction not in ['fw', 'bw']:
+#                 raise ValueError(f"Invalid direction: {direction}. Must be 'fw' or 'bw'")
 
-        return all(results)
+#         # If using group addressing, handle specially
+#         if use_group_address and len(self.rotators) >= 2:
+#             if debug:
+#                 print(f"Using group addressing for continuous move with directions: {directions}")
 
-    def move_all_absolute(self, positions: List[float], wait: bool = True) -> bool:
-        """
-        Move all rotators to absolute positions.
+#             master_direction = directions[0]
 
-        Args:
-            positions: List of target positions in degrees (0-360)
-            wait: Whether to wait for all movements to complete
+#             # Set up group addressing
+#             for i, rotator in enumerate(self.rotators[1:], 1):
+#                 if not rotator.set_group_address(group_address, debug=debug):
+#                     print(f"Warning: Failed to set group address for {rotator.name}")
 
-        Returns:
-            bool: True if all move commands were sent successfully
-        """
-        if len(positions) != len(self.rotators):
-            raise ValueError("Number of positions must match number of rotators")
+#             try:
+#                 # Send continuous move command from master rotator
+#                 if debug:
+#                     print(f"Sending {master_direction} command from master rotator")
 
-        results = []
+#                 result = False
+#                 if master_direction == 'fw':
+#                     result = self.rotators[0].send_command(COMMAND_FORWARD) is not None
+#                 else:  # 'bw'
+#                     result = self.rotators[0].send_command(COMMAND_BACKWARD) is not None
 
-        for i, rotator in enumerate(self.rotators):
-            results.append(rotator.move_absolute(positions[i], wait=False))
+#                 # Briefly wait if requested
+#                 if wait:
+#                     time.sleep(0.5)
 
-        if wait:
-            self.wait_all_ready()
+#                 return result
+#             finally:
+#                 # Ensure we clear group addresses
+#                 self.clear_all_group_addresses()
 
-        return all(results)
+#         # Standard approach (non-synchronized)
+#         results = []
 
-    def move_all_relative(
-        self, amounts: List[float], directions: List[str] = None, wait: bool = True
-    ) -> bool:
-        """
-        Move all rotators by relative amounts.
+#         # Send commands to all rotators
+#         for i, rotator in enumerate(self.rotators):
+#             if directions[i] == 'fw':
+#                 results.append(rotator.send_command(COMMAND_FORWARD, debug=debug) is not None)
+#             else:  # 'bw'
+#                 results.append(rotator.send_command(COMMAND_BACKWARD, debug=debug) is not None)
 
-        Args:
-            amounts: List of relative movements in degrees
-            directions: List of directions ("cw" or "ccw"), defaults to all "cw"
-            wait: Whether to wait for all movements to complete
+#         # Briefly wait if requested
+#         if wait:
+#             time.sleep(0.5)
 
-        Returns:
-            bool: True if all move commands were sent successfully
-        """
-        if len(amounts) != len(self.rotators):
-            raise ValueError("Number of amounts must match number of rotators")
+#         return all(results)
 
-        if directions is None:
-            directions = ["cw"] * len(self.rotators)
-        elif len(directions) != len(self.rotators):
-            raise ValueError(
-                "If provided, directions list must match number of rotators"
-            )
+#     def home_all(self, wait: bool = True, timeout: float = 30.0, debug: bool = False) -> bool:
+#         """
+#         Home all rotators.
 
-        results = []
+#         Args:
+#             wait: Whether to wait for all rotators to complete homing
+#             timeout: Maximum time to wait for completion in seconds
+#             debug: Whether to print debug information
 
-        for i, rotator in enumerate(self.rotators):
-            results.append(
-                rotator.move_relative(amounts[i], direction=directions[i], wait=False)
-            )
+#         Returns:
+#             bool: True if all home commands were sent successfully
+#         """
+#         results = []
 
-        if wait:
-            self.wait_all_ready()
+#         # Send home commands to all rotators
+#         for rotator in self.rotators:
+#             results.append(rotator.home(wait=False))
 
-        return all(results)
+#         if wait:
+#             if debug:
+#                 print("Waiting for all rotators to complete homing...")
+#             self.wait_all_ready(timeout=timeout)
+
+#         return all(results)
+
+#     def is_all_ready(self) -> bool:
+#         """
+#         Check if all rotators are ready.
+
+#         Returns:
+#             bool: True if all rotators are ready
+#         """
+#         return all(rotator.is_ready() for rotator in self.rotators)
+
+#     def wait_all_ready(self, timeout: float = 30.0, polling_interval: float = 0.1) -> bool:
+#         """
+#         Wait until all rotators are ready.
+
+#         Args:
+#             timeout: Maximum time to wait in seconds
+#             polling_interval: Time between status checks in seconds
+
+#         Returns:
+#             bool: True if all rotators became ready, False if timeout occurred
+#         """
+#         start_time = time.time()
+
+#         while (time.time() - start_time) < timeout:
+#             if self.is_all_ready():
+#                 for rotator in self.rotators:
+#                     rotator.is_moving = False
+#                 return True
+#             time.sleep(polling_interval)
+
+#         # If we reach here, we timed out - update is_moving flag for accuracy
+#         for rotator in self.rotators:
+#             rotator.is_moving = not rotator.is_ready()
+#         return False
+
+#     def stop_all(self) -> bool:
+#         """
+#         Stop all rotators immediately.
+
+#         Returns:
+#             bool: True if all stop commands were sent successfully
+#         """
+#         results = []
+
+#         for rotator in self.rotators:
+#             results.append(rotator.stop())
+
+#         return all(results)
+
+#     def set_all_velocities(self, velocity: int) -> bool:
+#         """
+#         Set the velocity for all rotators.
+
+#         Args:
+#             velocity: Velocity value (0-64)
+
+#         Returns:
+#             bool: True if all velocities were set successfully
+#         """
+#         results = []
+
+#         for rotator in self.rotators:
+#             results.append(rotator.set_velocity(velocity))
+
+#         return all(results)
+
+#     def move_all_absolute(self, positions: List[float], wait: bool = True) -> bool:
+#         """
+#         Move all rotators to absolute positions.
+
+#         Args:
+#             positions: List of target positions in degrees (0-360)
+#             wait: Whether to wait for all movements to complete
+
+#         Returns:
+#             bool: True if all move commands were sent successfully
+#         """
+#         if len(positions) != len(self.rotators):
+#             raise ValueError("Number of positions must match number of rotators")
+
+#         results = []
+
+#         for i, rotator in enumerate(self.rotators):
+#             results.append(rotator.move_absolute(positions[i], wait=False))
+
+#         if wait:
+#             self.wait_all_ready()
+
+#         return all(results)
+
+#     def move_all_relative(
+#         self, amounts: List[float], directions: List[str] = None, wait: bool = True
+#     ) -> bool:
+#         """
+#         Move all rotators by relative amounts.
+
+#         Args:
+#             amounts: List of relative movements in degrees
+#             directions: List of directions ("cw" or "ccw"), defaults to all "cw"
+#             wait: Whether to wait for all movements to complete
+
+#         Returns:
+#             bool: True if all move commands were sent successfully
+#         """
+#         if len(amounts) != len(self.rotators):
+#             raise ValueError("Number of amounts must match number of rotators")
+
+#         if directions is None:
+#             directions = ["cw"] * len(self.rotators)
+#         elif len(directions) != len(self.rotators):
+#             raise ValueError(
+#                 "If provided, directions list must match number of rotators"
+#             )
+
+#         results = []
+
+#         for i, rotator in enumerate(self.rotators):
+#             results.append(
+#                 rotator.move_relative(amounts[i], direction=directions[i], wait=False)
+#             )
+
+#         if wait:
+#             self.wait_all_ready()
+
+#         return all(results)

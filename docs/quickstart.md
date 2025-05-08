@@ -18,14 +18,11 @@ elliptec-controller home
 # Move a specific rotator
 elliptec-controller move-abs -r 0 -pos 45.0
 
-# Move all rotators
-elliptec-controller move-all -pos 0 45 90
-
 # Get device information
 elliptec-controller info
 ```
 
-### Python API - Single Rotator
+### Python API Example
 
 ```python
 import serial
@@ -34,11 +31,15 @@ from elliptec_controller import ElliptecRotator
 # Open serial connection
 ser = serial.Serial("/dev/ttyUSB0", baudrate=9600, timeout=1)
 
-# Create rotator instance
-rotator = ElliptecRotator(ser, motor_address=3, name="HWP1")
+# Create rotator instance (replace port and address)
+rotator = ElliptecRotator("/dev/ttyUSB0", motor_address=1, name="MyRotator")
 
 try:
-    # Get device info
+    # Get device info (called automatically if port name is given)
+    # info = rotator.get_device_info() # You can call it manually if needed
+    # print(f"Device info: {rotator.device_info}")
+
+    # Home the device
     info = rotator.get_device_info()
     print(f"Device info: {info}")
 
@@ -53,42 +54,10 @@ try:
     print(f"Status: {status}")
 
 finally:
-    # Always close the serial connection
-    ser.close()
-```
-
-### Python API - Triple Rotator Setup
-
-```python
-from elliptec_controller import TripleRotatorController
-
-# Create controller
-controller = TripleRotatorController(
-    port="/dev/ttyUSB0",
-    addresses=[3, 6, 8],
-    names=["HWP1", "QWP", "HWP2"]
-)
-
-try:
-    # Home all rotators
-    controller.home_all(wait=True)
-
-    # Set velocities
-    controller.set_all_velocities(40)
-
-    # Move to specific positions
-    controller.move_all_absolute([30, 45, 60], wait=True)
-
-    # Move relative
-    controller.move_all_relative(
-        [10, 15, 20],  # amounts
-        ["cw", "cw", "ccw"],  # directions
-        wait=True
-    )
-
-finally:
-    # Always close the controller
-    controller.close()
+    # Always close the serial connection if you opened it manually
+    # If ElliptecRotator was initialized with a port name string,
+    # it handles closing automatically.
+    # ser.close()
 ```
 
 ## Common Operations
@@ -96,93 +65,63 @@ finally:
 ### Error Handling
 
 ```python
-from elliptec_controller import TripleRotatorController
+import serial
+from elliptec_controller import ElliptecRotator
 
+rotator = None
 try:
-    controller = TripleRotatorController(
-        port="/dev/ttyUSB0",
-        addresses=[3, 6, 8]
+    rotator = ElliptecRotator(
+        port="/dev/ttyUSB0", # Replace with your port
+        motor_address=1,    # Replace with your address
+        debug=True
     )
+except serial.SerialException as e:
+    print(f"Failed to connect to rotator: {e}")
+    exit(1)
 except Exception as e:
-    print(f"Failed to initialize controller: {e}")
+    print(f"Failed to initialize rotator: {e}")
     exit(1)
 
 try:
-    # Check if rotators are ready
-    if not controller.is_all_ready():
-        print("Not all rotators ready. Homing...")
-        controller.home_all(wait=True)
+    # Check if rotator is ready before operation
+    if not rotator.is_ready():
+        print("Rotator not ready. Homing...")
+        if not rotator.home(wait=True):
+             print("Homing failed.")
+             # Decide how to proceed if homing fails
+             exit(1)
 
     # Perform operations
-    controller.move_all_absolute([0, 0, 0], wait=True)
+    print("Moving to 0 degrees...")
+    if rotator.move_absolute(0.0, wait=True):
+        print("Move successful.")
+    else:
+        print("Move failed.")
 
 except Exception as e:
     print(f"Error during operation: {e}")
-    # Attempt to stop all rotators in case of error
+    # Attempt to stop the rotator in case of error
     try:
-        controller.stop_all()
-    except:
-        pass
+        print("Attempting to stop rotator...")
+        rotator.stop()
+    except Exception as stop_e:
+        print(f"Failed to stop rotator: {stop_e}")
 
 finally:
-    controller.close()
-```
+    # ElliptecRotator closes the port automatically if it opened it.
+    print("Operation finished.")
 
-### Working with Individual Rotators
-
-```python
-controller = TripleRotatorController(...)
-
-# Access individual rotators
-hwp1 = controller.rotators[0]
-qwp = controller.rotators[1]
-hwp2 = controller.rotators[2]
-
-# Individual control
-hwp1.move_absolute(45)
-qwp.set_velocity(30)
-hwp2.home()
-
-# Get individual status
-for rotator in controller.rotators:
-    print(f"{rotator.name} status: {rotator.get_status()}")
 ```
 
 ## Best Practices
 
-1. **Always use context management or try/finally blocks**
-   ```python
-   with TripleRotatorController(...) as ctrl:
-       ctrl.home_all(wait=True)
-   ```
+1. **Use try/except/finally for Robustness:** Always wrap communication and control logic in `try...except...finally` blocks to handle potential serial errors, timeouts, or device issues, ensuring resources like serial ports are managed correctly (though the class handles port closing if initialized with a port name).
 
-2. **Check device status before operations**
-   ```python
-   if controller.is_all_ready():
-       controller.move_all_absolute([0, 45, 90])
-   else:
-       print("Devices not ready")
-   ```
+2. **Check Device Status:** Before critical operations, check if the device is ready using `rotator.is_ready()`. Consider homing (`rotator.home()`) if the device state is unknown or not ready.
 
-3. **Use wait=True for sequential operations**
-   ```python
-   # This ensures the home completes before moving
-   controller.home_all(wait=True)
-   controller.move_all_absolute([45, 45, 45], wait=True)
-   ```
+3. **Use `wait=True` for Sequential Operations:** When one movement must complete before the next begins, use the `wait=True` argument in methods like `move_absolute()`, `move_relative()`, and `home()`.
 
-4. **Handle timeouts appropriately**
-   ```python
-   import serial
-   try:
-       controller = TripleRotatorController(
-           port="/dev/ttyUSB0",
-           addresses=[3, 6, 8],
-           timeout=1.0  # 1 second timeout
-       )
-   except serial.SerialTimeoutException:
-       print("Connection timed out")
-   ```
+4. **Understand Timeouts:** The `send_command` method has internal timeouts. You can override them for specific commands if needed (e.g., `rotator.get_status(timeout_override=0.5)`). Be aware that long operations like homing or optimization might take time; the `wait=True` flag handles waiting based on status checks, not just fixed timeouts.
 
 ## Next Steps
 
