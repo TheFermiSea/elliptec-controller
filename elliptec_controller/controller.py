@@ -1087,23 +1087,100 @@ class TripleRotatorController:
                 results.append(True)
         return all(results)
 
-    def home_all(self, wait: bool = True) -> bool:
+    def continuous_move_all(self, directions: List[str], wait: bool = False,
+                             use_group_address: bool = False, group_address: str = "F",
+                             debug: bool = False) -> bool:
+        """
+        Start continuous movement for all rotators.
+        
+        Args:
+            directions: List of directions for each rotator ('fw' for forward, 'bw' for backward)
+            wait: Whether to wait briefly to ensure movement has started
+            use_group_address: Whether to use group addressing for synchronized movement
+            group_address: The group address to use (0-F) if use_group_address is True
+            debug: Whether to print debug information
+            
+        Returns:
+            bool: True if all continuous move commands were sent successfully
+        """
+        if len(directions) != len(self.rotators):
+            raise ValueError("directions must contain one entry for each rotator")
+            
+        # Validate all directions
+        for direction in directions:
+            if direction not in ['fw', 'bw']:
+                raise ValueError(f"Invalid direction: {direction}. Must be 'fw' or 'bw'")
+                
+        # If using group addressing, handle specially
+        if use_group_address and len(self.rotators) >= 2:
+            if debug:
+                print(f"Using group addressing for continuous move with directions: {directions}")
+                
+            master_direction = directions[0]
+            
+            # Set up group addressing
+            for i, rotator in enumerate(self.rotators[1:], 1):
+                if not rotator.set_group_address(group_address, debug=debug):
+                    print(f"Warning: Failed to set group address for {rotator.name}")
+                    
+            try:
+                # Send continuous move command from master rotator
+                if debug:
+                    print(f"Sending {master_direction} command from master rotator")
+                    
+                result = False
+                if master_direction == 'fw':
+                    result = self.rotators[0].send_command(COMMAND_FORWARD) is not None
+                else:  # 'bw'
+                    result = self.rotators[0].send_command(COMMAND_BACKWARD) is not None
+                    
+                # Briefly wait if requested
+                if wait:
+                    time.sleep(0.5)
+                    
+                return result
+            finally:
+                # Ensure we clear group addresses
+                self.clear_all_group_addresses()
+                
+        # Standard approach (non-synchronized)
+        results = []
+        
+        # Send commands to all rotators
+        for i, rotator in enumerate(self.rotators):
+            if directions[i] == 'fw':
+                results.append(rotator.send_command(COMMAND_FORWARD, debug=debug) is not None)
+            else:  # 'bw'
+                results.append(rotator.send_command(COMMAND_BACKWARD, debug=debug) is not None)
+                
+        # Briefly wait if requested
+        if wait:
+            time.sleep(0.5)
+            
+        return all(results)
+        
+    def home_all(self, wait: bool = True, timeout: float = 30.0, debug: bool = False) -> bool:
         """
         Home all rotators.
 
         Args:
             wait: Whether to wait for all rotators to complete homing
+            timeout: Maximum time to wait for completion in seconds
+            debug: Whether to print debug information
 
         Returns:
             bool: True if all home commands were sent successfully
         """
         results = []
 
+        # Send home commands to all rotators
         for rotator in self.rotators:
             results.append(rotator.home(wait=False))
 
         if wait:
-            self.wait_all_ready()
+            if debug:
+                print("Waiting for all rotators to complete homing...")
+            self.wait_all_ready(timeout=timeout)
 
         return all(results)
 
