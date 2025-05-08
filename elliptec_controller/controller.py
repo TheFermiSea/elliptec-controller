@@ -448,7 +448,7 @@ class ElliptecRotator:
         self.is_moving = False
         return response and response.startswith(f"{self.address}GS")
 
-    def home(self, wait: bool = fTrue) -> bool:
+    def home(self, wait: bool = True) -> bool:
         """
         Move the rotator to its home position.
 
