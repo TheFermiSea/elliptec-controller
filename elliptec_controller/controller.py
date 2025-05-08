@@ -616,9 +616,9 @@ class ElliptecRotator:
 
         # Process the response
         if response and response.startswith(f"{self.address}IN"):
-            # Based on the ELL14 protocol, the response format is: <address>IN<data>\\r\\n
+            # Based on the ELL14 protocol, the response format is: <address>IN<data>
             # First, remove the address and command prefix (e.g., "8IN") and strip
-            data = response[len(f"{self.address}IN") :].strip(" \r\n\t")
+            data = response[len(f"{self.address}IN"):].strip(" \r\n\t")
 
             # Based on the Thorlabs Elliptec protocol, extract information
             try:
@@ -659,110 +659,124 @@ class ElliptecRotator:
                         return info
 
                 # According to protocol manual, the response should have a specific format
-                elif len(data) >= 24:  # Make sure we have enough data
+                if len(data) >= 24:  # Make sure we have enough data for at least the basic fields
+                    # First, check if the response is in a comma-separated format like in the manual example
+                    if "," in data:
+                        parts = [part.strip() for part in data.split(",")]
+                        type_idx = next((i for i, p in enumerate(parts) if len(p) == 2 and p.isalnum()), 2)
+                        
+                        if len(parts) >= type_idx + 7:
+                            # Found all required fields
+                            info = {
+                                "type": parts[type_idx],
+                                "serial_number": parts[type_idx + 1],
+                                "year": parts[type_idx + 2],
+                                "firmware": parts[type_idx + 3],
+                                "hardware": parts[type_idx + 4],
+                                "travel": parts[type_idx + 5],
+                                "pulses_per_unit": parts[type_idx + 6],
+                            }
+                            
+                            # Format firmware version
+                            try:
+                                fw_major, fw_minor = int(info["firmware"]) // 100, int(info["firmware"]) % 100
+                                info["firmware_formatted"] = f"{fw_major}.{fw_minor}"
+                            except (ValueError, TypeError):
+                                pass
+                            
+                            # For hardware, check if the MSB signifies thread type
+                            try:
+                                hw_val = int(info["hardware"], 16 if info["hardware"].startswith("0x") else 10)
+                                thread_type = "imperial" if hw_val & 0x80 else "metric"
+                                hw_release = hw_val & 0x7F
+                                info["thread_type"] = thread_type
+                                info["hardware_release"] = str(hw_release)
+                            except (ValueError, TypeError):
+                                pass
+                        else:
+                            # Not enough parts, use what we have
+                            info["type"] = parts[type_idx] if len(parts) > type_idx else "Unknown"
+                            if len(parts) > type_idx + 1:
+                                info["serial_number"] = parts[type_idx + 1]
+                    else:
+                        # For compatibility with existing tests that expect this format:
+                        # Format appears to be fixed positions for each field
+                        info = {
+                            "type": data[0:2],          # Device type (e.g., "06" for rotators)
+                            "firmware": data[2:6],      # Firmware version (4 chars)
+                            "serial_number": data[6:14],# Serial number (8 chars)
+                            "year_month": data[14:18],  # Year and month of manufacture (4 chars)
+                            "day_batch": data[18:20],   # Day and batch of manufacture (2 chars)
+                            "hardware": data[20:24],    # Hardware version (4 chars)
+                            # Manual specifies travel values after hardware version
+                            "max_range": data[24:30] if len(data) >= 30 else "",
+                        }
+
+                        # Format some fields for better readability
+                        if "firmware" in info:
+                            # Parse and format firmware version
+                            try:
+                                major = int(info["firmware"][0:2], 16)
+                                minor = int(info["firmware"][2:4], 16)
+                                info["firmware_formatted"] = f"{major}.{minor}"
+                            except (ValueError, TypeError):
+                                pass
+
+                        if "hardware" in info:
+                            # Parse and format hardware version
+                            try:
+                                major = int(info["hardware"][0:2], 16)
+                                minor = int(info["hardware"][2:4], 16)
+                                info["hardware_formatted"] = f"{major}.{minor}"
+                            except (ValueError, TypeError):
+                                pass
+
+                        if "year_month" in info:
+                            # Parse and format manufacture date
+                            try:
+                                year = info["year_month"][0:2]
+                                month = info["year_month"][2:4]
+                                info["manufacture_date"] = f"20{year}-{month}"
+                            except (ValueError, TypeError, IndexError):
+                                pass
+                elif data.startswith("I1") or data.startswith("I2"):
+                    # This appears to be a motor info response, not a device info response
+                    if len(data) >= 22:
+                        info = {
+                            "type": "Elliptec Motor",
+                            "motor": "1" if data.startswith("I1") else "2",
+                            "jog_step": data[2:10],
+                            "frequency": data[10:18],
+                            "amplitude": data[18:20],
+                            "phase": data[20:22],
+                        }
+                    else:
+                        info = {
+                            "type": "Elliptec Motor",
+                            "motor": "1" if data.startswith("I1") else "2",
+                        }
+                else:
+                    # If we don't have enough data but we have a response, try to parse minimal info
+                    print(f"Response data too short or in unexpected format: '{data}', length: {len(data)}")
+                    if debug:
+                        print(f"Raw bytes (hex): {' '.join(f'{ord(c):02x}' for c in data)}")
+                    parts = data.split()
                     info = {
-                        "type": data[0:2],  # Device type (e.g., "06" for rotators)
-                        "firmware": data[2:6],  # Firmware version (4 bytes)
-                        "serial_number": data[6:14],  # Serial number (8 bytes)
-                        "year_month": data[
-                            14:18
-                        ],  # Year and month of manufacture (4 bytes)
-                        "day_batch": data[
-                            18:20
-                        ],  # Day and batch of manufacture (2 bytes)
-                        "hardware": data[20:24],  # Hardware version (4 bytes)
-                        # Manual specifies 6 bytes for max_range
-                        "max_range": data[24:30] if len(data) >= 30 else "",
+                        "type": "Elliptec Device",
+                        "serial": parts[0] if len(parts) > 0 else "",
+                        "firmware": parts[1] if len(parts) > 1 else "",
                     }
 
-                    # Format some fields for better readability
-                    if "firmware" in info:
-                        # Parse and format firmware version
-                        major = int(info["firmware"][0:2], 16)
-                        minor = int(info["firmware"][2:4], 16)
-                        info["firmware_formatted"] = f"{major}.{minor}"
-
-                    if "hardware" in info:
-                        # Parse and format hardware version
-                        major = int(info["hardware"][0:2], 16)
-                        minor = int(info["hardware"][2:4], 16)
-                        info["hardware_formatted"] = f"{major}.{minor}"
-
-                    if "year_month" in info:
-                        # Parse and format manufacture date
-                        year = info["year_month"][0:2]
-                        month = info["year_month"][2:4]
-                        info["manufacture_date"] = f"20{year}-{month}"
-                else:
-                    # If we don't have enough data but we have a response, try to parse it according to manual example format
-                    # Example: "0, IN, 06, 12345678, 2015, 01, 81, 001F, 00000001"
-                    if "," in data:
-                        parts = data.split(",")
-                        if (
-                            len(parts) >= 8
-                        ):  # We need at least device type, serial, and firmware
-                            info = {
-                                "type": parts[0].strip() if parts[0].strip() else "00",
-                                "serial_number": parts[1].strip()
-                                if len(parts) > 1
-                                else "",
-                                "year": parts[2].strip() if len(parts) > 2 else "",
-                                "firmware": parts[3].strip() if len(parts) > 3 else "",
-                                "hardware": parts[4].strip() if len(parts) > 4 else "",
-                                "travel": parts[5].strip() if len(parts) > 5 else "",
-                                "pulses_per_unit": parts[6].strip()
-                                if len(parts) > 6
-                                else "",
-                            }
-                    else:
-                        # Fallback to alternate format mentioned in manual example:
-                        # "0I1100428FFFFFFFF00BD008B" (for motor info)
-                        if data.startswith("I1") or data.startswith("I2"):
-                            # This appears to be a motor info response
-                            if len(data) >= 22:
-                                info = {
-                                    "type": "Elliptec Motor",
-                                    "motor": "1" if data.startswith("I1") else "2",
-                                    "jog_step": data[2:10],
-                                    "frequency": data[10:18],
-                                    "amplitude": data[18:20],
-                                    "phase": data[20:22],
-                                }
-                                # }TripleRotatorController
-                            else:
-                                info = {
-                                    "type": "Elliptec Motor",
-                                    "motor": "1" if data.startswith("I1") else "2",
-                                }
-                        else:
-                            # Fallback to legacy format for older firmware
-                            legacy_parts = data.split()
-                            if len(legacy_parts) >= 2:
-                                info = {
-                                    "type": "Elliptec Rotator",
-                                    "serial": legacy_parts[0]
-                                    if len(legacy_parts) > 0
-                                    else "",
-                                    "firmware": legacy_parts[1]
-                                    if len(legacy_parts) > 1
-                                    else "",
-                                }
-                            else:
-                                print(
-                                    f"Response data too short or in unexpected format: '{data}', length: {len(data)}"
-                                )
-                                if debug:
-                                    print(
-                                        f"Raw bytes (hex): {' '.join(f'{ord(c):02x}' for c in data)}"
-                                    )
-                                info = {"type": "Elliptec Rotator"}
             except Exception as e:
                 print(f"Error parsing device info: {e}")
+                if debug:
+                    import traceback
+                    traceback.print_exc()
                 # Ensure that at least the 'type' key exists
-                return {"type": "Elliptec Rotator"}
+                info = {"type": "Elliptec Device", "error": str(e)}
         else:
             # If we didn't get a valid response, return basic info
-            info = {"type": "Elliptec Rotator"}
+            info = {"type": "Elliptec Device", "error": "No valid response"}
 
         if debug:
             print(f"Device information for {self.name}: {info}")
