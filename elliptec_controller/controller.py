@@ -28,6 +28,7 @@ COMMAND_SET_VELOCITY = "sv"  # Set velocity (_HOSTSET_VELOCITY "sv")
 COMMAND_GET_VELOCITY = "gv"  # Get velocity (_HOSTREQ_VELOCITY "gv")
 COMMAND_SET_HOME_OFFSET = "so"  # Set home offset (_HOSTSET_HOMEOFFSET "so")
 COMMAND_GET_HOME_OFFSET = "go"  # Get home offset (_HOSTREQ_HOMEOFFSET "go")
+COMMAND_GROUP_ADDRESS = "ga"  # Set group address for synchronized movement (_HOST_GROUPADDRESS "ga")
 COMMAND_OPTIMIZE_MOTORS = "om"  # Optimize motors (_HOST_OPTIMIZE_MOTORS "om")
 COMMAND_GET_INFO = "in"  # Get device information (_DEVGET_INFORMATION "IN")
 COMMAND_SET_JOG_STEP = "sj"  # Set jog step size
@@ -134,6 +135,7 @@ class ElliptecRotator:
         self.is_moving = False
         self.in_group_mode = False
         self.group_address = str(group_address) if group_address is not None else None
+        self.offset = 0.0  # Default offset for group movements (in degrees)
         self.velocity = 60  # Default to ~60% velocity
         self.optimal_frequency = None
         self._jog_step_size = 1.0  # Default jog step size in degrees
@@ -488,7 +490,7 @@ class ElliptecRotator:
 
         return 0.0  # Return 0 if response wasn't valid PO
 
-    def move_absolute(self, degrees: float, wait: bool = True) -> bool:
+    def move_absolute(self, degrees: float, wait: bool = True, debug: bool = False) -> bool:
         """
         Move the rotator to an absolute position.
 
@@ -499,21 +501,37 @@ class ElliptecRotator:
         Args:
             degrees: Target position in degrees (0-360)
             wait: Whether to wait for movement to complete
+            debug: Whether to print debug information
 
         Returns:
             bool: True if the move command was sent successfully
         """
         # Normalize to 0-360 range
         degrees = degrees % 360
+        
+        # Apply offset if in group mode
+        if self.in_group_mode and hasattr(self, 'offset') and self.offset != 0:
+            # Apply the offset for synchronized movement
+            adjusted_degrees = (degrees + self.offset) % 360
+            if debug:
+                print(f"Applying offset of {self.offset} degrees to {self.name}: {degrees} -> {adjusted_degrees}")
+        else:
+            adjusted_degrees = degrees
+            if debug and hasattr(self, 'offset') and self.offset != 0:
+                print(f"Not in group mode but offset is set: {self.offset} (ignored)")
 
         # Convert to hex position using device-specific pulse count if available
         if hasattr(self, 'pulse_per_revolution') and self.pulse_per_revolution:
-            hex_pos = degrees_to_hex(degrees, self.pulse_per_revolution)
+            hex_pos = degrees_to_hex(adjusted_degrees, self.pulse_per_revolution)
+            if debug:
+                print(f"Using device-specific pulse count: {self.pulse_per_revolution} for {self.name}")
         else:
-            hex_pos = degrees_to_hex(degrees)
+            hex_pos = degrees_to_hex(adjusted_degrees)
+            if debug:
+                print(f"Using default pulse count for {self.name}")
 
         # Send the command
-        response = self.send_command(COMMAND_MOVE_ABS, data=hex_pos)
+        response = self.send_command(COMMAND_MOVE_ABS, data=hex_pos, debug=debug)
 
         # Set moving state regardless of response - command was sent
         self.is_moving = True
@@ -611,6 +629,93 @@ class ElliptecRotator:
         print(f"Failed to start motor optimization on {self.name}. Response: {response}")
         return False
 
+    def set_group_address(self, group_address: str, offset: float = 0.0, debug: bool = False) -> bool:
+        """
+        Set a group address for synchronized movement.
+        
+        This allows multiple devices to be addressed simultaneously as a temporary group,
+        so that their movement can be synchronized. Once the motion has been completed
+        the device returns to its original address.
+        
+        Args:
+            group_address (str): The group address (0-F) to assign to this device
+            offset (float): Angular offset in degrees to apply during group movements
+            debug (bool): Whether to print debug information
+            
+        Returns:
+            bool: True if the group address was set successfully
+        """
+        # Validate group address
+        try:
+            int(group_address, 16)  # Check if it's a valid hex character
+            if len(group_address) != 1:
+                raise ValueError(f"Group address must be a single hex character (0-F), got: {group_address}")
+        except ValueError:
+            print(f"Invalid group address: {group_address}. Must be a single hex character (0-F).")
+            return False
+        
+        # Store the offset for later use
+        self.offset = offset
+        
+        if debug:
+            print(f"Setting {self.name} to listen to group address {group_address} with offset {offset}")
+        
+        # Send the group address command
+        response = self.send_command(COMMAND_GROUP_ADDRESS, data=group_address)
+        
+        # Check for a successful response
+        if response and response.startswith(f"{group_address}GS"):
+            self.in_group_mode = True
+            self.group_address = group_address
+            if debug:
+                print(f"Successfully set {self.name} to group address {group_address}")
+            return True
+        else:
+            self.in_group_mode = False
+            if debug:
+                print(f"Failed to set {self.name} to group address {group_address}")
+            return False
+    
+    def clear_group_address(self) -> bool:
+        """
+        Clear the group address and return to normal addressing mode.
+        
+        After a synchronized movement is complete, this method can be used
+        to explicitly return the device to its original address if needed.
+        
+        Returns:
+            bool: True if the group address was successfully cleared
+        """
+        if not self.in_group_mode or not self.group_address:
+            # Already in normal mode
+            self.in_group_mode = False
+            self.offset = 0.0
+            return True
+            
+        # Store current state
+        original_address = self.address
+        
+        try:
+            # Send command to return to original address
+            response = self.send_command(COMMAND_GROUP_ADDRESS, data=self.address)
+            
+            # Check response
+            if response and response.startswith(f"{self.address}GS"):
+                self.in_group_mode = False
+                self.offset = 0.0
+                return True
+            else:
+                # If we get a bad response, at least reset our internal state
+                self.in_group_mode = False
+                self.offset = 0.0
+                return False
+        except Exception as e:
+            # Even if there's an error, reset our internal state
+            print(f"Error clearing group address: {e}")
+            self.in_group_mode = False
+            self.offset = 0.0
+            return False
+            
     def get_device_info(self, debug: bool = False) -> Dict[str, str]:
         """
         Get detailed information about the rotator device.
@@ -878,6 +983,109 @@ class TripleRotatorController:
         """Close the serial connection."""
         if hasattr(self, "serial") and self.serial.is_open:
             self.serial.close()
+            
+    def synchronized_move(self, degrees: float, group_address: str = "F", 
+                          offsets: List[float] = None, wait: bool = True,
+                          timeout: float = 30.0, debug: bool = False) -> bool:
+        """
+        Move rotators in a synchronized manner using group addressing.
+        
+        This method sets up a temporary group for synchronized movement, where
+        all rotators will respond to the same group address. Each rotator can
+        have its own offset for precise positioning relationships.
+        
+        Args:
+            degrees: Target position in degrees (0-360)
+            group_address: The group address to use (0-F)
+            offsets: List of angular offsets in degrees for each rotator (optional)
+            wait: Whether to wait for movement to complete
+            timeout: Maximum time to wait for completion (seconds)
+            debug: Whether to print debug information
+            
+        Returns:
+            bool: True if the synchronized move was successful
+        """
+        if len(self.rotators) < 2:
+            print("Warning: Synchronized movement requires at least 2 rotators")
+            if len(self.rotators) == 1:
+                # Just do a normal move for a single rotator
+                return self.rotators[0].move_absolute(degrees, wait=wait)
+            return False
+            
+        # Apply defaults if no offsets provided
+        if offsets is None:
+            offsets = [0.0] * len(self.rotators)
+        elif len(offsets) != len(self.rotators):
+            raise ValueError("Number of offsets must match number of rotators")
+            
+        if debug:
+            print(f"Setting up synchronized move to {degrees} degrees with offsets: {offsets}")
+            
+        # First rotator will be the master (keep its address)
+        master_rotator = self.rotators[0]
+        slave_rotators = self.rotators[1:]
+        
+        try:
+            # Set group address and offsets for slave rotators
+            group_setup_ok = True
+            for i, rotator in enumerate(slave_rotators):
+                offset = offsets[i+1] if i+1 < len(offsets) else 0.0
+                if not rotator.set_group_address(group_address=group_address, offset=offset):
+                    print(f"Warning: Failed to set group address for {rotator.name}")
+                    group_setup_ok = False
+                elif debug:
+                    print(f"Set {rotator.name} to group address {group_address} with offset {offset}")
+                    
+            if not group_setup_ok:
+                print("Warning: Group setup incomplete, some rotators may not move in sync")
+            
+            # Set offset for master rotator (doesn't change address)
+            master_rotator.offset = offsets[0] if offsets else 0.0
+            if debug and offsets[0] != 0:
+                print(f"Set master rotator offset to {offsets[0]} degrees")
+            
+            # Execute the move from the master rotator
+            if debug:
+                print(f"Executing synchronized move to {degrees} degrees from master rotator")
+            result = master_rotator.move_absolute(degrees, wait=False)
+            
+            # Wait for all to complete if requested
+            if wait:
+                if debug:
+                    print("Waiting for all rotators to complete movement...")
+                wait_result = self.wait_all_ready(timeout=timeout)
+                if not wait_result and debug:
+                    print(f"Warning: Timeout ({timeout}s) while waiting for rotators to complete")
+                result = result and wait_result
+                
+            return result
+            
+        finally:
+            # Always reset group mode and offsets, even if there was an error
+            if debug:
+                print("Clearing group addresses")
+            self.clear_all_group_addresses()
+        
+    def clear_all_group_addresses(self) -> bool:
+        """
+        Clear group addresses for all rotators.
+        
+        This method returns all rotators to their original addresses
+        and clears any offsets that were set for group movement.
+        
+        Returns:
+            bool: True if all group addresses were successfully cleared
+        """
+        results = []
+        for rotator in self.rotators:
+            # Only clear if the rotator is in group mode
+            if rotator.in_group_mode:
+                results.append(rotator.clear_group_address())
+            else:
+                # Just reset the offset even if not in group mode
+                rotator.offset = 0.0
+                results.append(True)
+        return all(results)
 
     def home_all(self, wait: bool = True) -> bool:
         """
@@ -908,12 +1116,13 @@ class TripleRotatorController:
         """
         return all(rotator.is_ready() for rotator in self.rotators)
 
-    def wait_all_ready(self, timeout: float = 30.0) -> bool:
+    def wait_all_ready(self, timeout: float = 30.0, polling_interval: float = 0.1) -> bool:
         """
         Wait until all rotators are ready.
 
         Args:
             timeout: Maximum time to wait in seconds
+            polling_interval: Time between status checks in seconds
 
         Returns:
             bool: True if all rotators became ready, False if timeout occurred
@@ -925,8 +1134,11 @@ class TripleRotatorController:
                 for rotator in self.rotators:
                     rotator.is_moving = False
                 return True
-            time.sleep(0.1)
+            time.sleep(polling_interval)
 
+        # If we reach here, we timed out - update is_moving flag for accuracy
+        for rotator in self.rotators:
+            rotator.is_moving = not rotator.is_ready()
         return False
 
     def stop_all(self) -> bool:
