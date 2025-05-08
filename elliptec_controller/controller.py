@@ -465,12 +465,12 @@ class ElliptecRotator:
         self.is_moving = True
 
         # If we got a position response, that means it succeeded immediately
-        if response and response.startswith(f"{self.address}PO"):
+        if response and response.startswith(f"{self.active_address}PO"):
             self.is_moving = False
             return True
 
         # If we got a status response
-        if response and response.startswith(f"{self.address}GS"):
+        if response and response.startswith(f"{self.active_address}GS"):
             if wait:
                 return self.wait_until_ready()
             return True
