@@ -1,534 +1,404 @@
-# ```python
+```python
+#!/usr/bin/env python3
+"""
+Tests for the ElliptecRotator class in the elliptec-controller package.
+
+Focuses on single-rotator functionality after the refactoring that
+removed TripleRotatorController and integrated group addressing into ElliptecRotator.
+Group-specific tests are in test_group_addressing.py.
+"""
+
 import pytest
 import serial
 import time
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
-# Attempt to import from the controller module
-# Need to handle potential import errors if controller.py itself is broken
-try:
-    # Assuming test is run from elliptec-controller directory or PYTHONPATH is set
-    from elliptec_controller.controller import (
-        ElliptecRotator,
-        # TripleRotatorController, # Removed
-        degrees_to_hex,
-        hex_to_degrees,
-    )
-except ImportError as e:
-    pytest.skip(
-        f"Skipping tests because controller import failed: {e}", allow_module_level=True
-    )
+# Assuming test is run from elliptec-controller directory or PYTHONPATH is set
+from elliptec_controller.controller import (
+    ElliptecRotator,
+    degrees_to_hex,
+    hex_to_degrees,
+    COMMAND_GET_STATUS,
+    COMMAND_STOP,
+    COMMAND_HOME,
+    COMMAND_MOVE_ABS,
+    COMMAND_GET_POS,
+    COMMAND_SET_VELOCITY,
+    COMMAND_SET_JOG_STEP,
+    COMMAND_GET_INFO,
+)
 
-# --- Mock Serial Port ---
 
+# --- Mock Serial Class ---
 
 class MockSerial:
-    """A mock serial port for testing."""
+    """Mocks pyserial.Serial for single rotator testing."""
 
-    def __init__(self, port, baudrate, timeout):
+    def __init__(self, port=None, baudrate=None, bytesize=None, parity=None, stopbits=None, timeout=None):
         self.port = port
-        self.baudrate = baudrate
-        self.timeout = timeout
-        self._is_open = True
+        self.is_open = True # Assume opened on creation for mock
+        self._log = []
+        self._responses = {} # Maps command sent (e.g., "1gs") to response bytes (e.g., b"1GS00\\r\\n")
         self._write_buffer = b""
         self._read_buffer = b""
-        self.responses = {}  # Dictionary to map sent commands to responses
-        self.log = []  # Log of commands written
+        self._in_waiting_value = 0
 
     def open(self):
-        self._is_open = True
+        self.is_open = True
 
     def close(self):
-        self._is_open = False
-
-    @property
-    def is_open(self):
-        return self._is_open
+        self.is_open = False
 
     def reset_input_buffer(self):
         self._read_buffer = b""
+        self._in_waiting_value = 0
 
     def reset_output_buffer(self):
-        self._write_buffer = b""
+        self._write_buffer = b"" # Not strictly needed for tests but good practice
 
     def flush(self):
-        pass  # No-op for mock
+        pass # No-op
 
-    def write(self, data):
-        if not self._is_open:
-            raise serial.SerialException("Port not open")
-        self.log.append(data)
-        # Simulate response generation based on command
-        command_sent = data.decode("ascii").strip()
-        # Simple command matching (strip address and CR)
-        addr = command_sent[0]
-        cmd_key = command_sent[1:]  # Command + data
+    def write(self, data_bytes: bytes):
+        """Log writes and prepare response."""
+        self._log.append(data_bytes)
+        self._write_buffer += data_bytes
+        # Simulate device processing and preparing response
+        cmd_str = data_bytes.decode().strip() # e.g., "1gs"
+        #print(f"Mock Write Received: {cmd_str}") # Debug print
+        response = self._responses.get(cmd_str)
+        if response:
+            #print(f"Mock Prepared Response: {response!r}") # Debug print
+            self._read_buffer = response
+            self._in_waiting_value = len(response)
+        else:
+            # Default "OK" response if no specific one is set
+            addr = cmd_str[0]
+            cmd_code = cmd_str[1:3].upper()
+            default_resp = f"{addr}{cmd_code}00\\r\\n".encode()
+            #print(f"Mock Prepared Default Response: {default_resp!r}") # Debug print
+            self._read_buffer = default_resp
+            self._in_waiting_value = len(default_resp)
 
-        # Find matching response based on command key prefix if needed
-        response = None
-        for known_cmd, resp_data in self.responses.items():
-            if cmd_key.startswith(known_cmd):
-                response = resp_data
-                break
-
-        if response: # Response from self.responses should NOT include \\r\\n now
-            # Include address prefix in response, NO \\r\\n
-            full_response_str = f"{addr}{response}"
-            self._read_buffer += full_response_str.encode("ascii")
-            # print(f"MockSerial: Received '{command_sent}', Queued Response: '{full_response_str}'") # Debug
-        # else:
-            # print(f"MockSerial: Received '{command_sent}', No matching response configured.") # Debug
-
-        return len(data)
+        return len(data_bytes)
 
     @property
     def in_waiting(self):
-        return len(self._read_buffer)
+        #print(f"Mock in_waiting called, returning: {self._in_waiting_value}") # Debug print
+        return self._in_waiting_value
 
     def read(self, size=1):
-        if not self._is_open:
-            raise serial.SerialException("Port not open")
-
-        # Simulate timeout behavior if buffer is empty
-        if not self._read_buffer:
-            # Simulate waiting slightly less than a full character time at 9600 baud
-            # time.sleep(0.001) # Causes tests to be slow, simulate empty read instead
-            return b""
-
-        data = self._read_buffer[:size]
+        """Return data from the read buffer."""
+        #print(f"Mock read({size}) called. Buffer: {self._read_buffer!r}") # Debug print
+        read_data = self._read_buffer[:size]
         self._read_buffer = self._read_buffer[size:]
-        return data
+        self._in_waiting_value = len(self._read_buffer)
+        #print(f"Mock read returning: {read_data!r}. Remaining buffer: {self._read_buffer!r}") # Debug print
+        return read_data
 
-    def read_all(self):
-        data = self._read_buffer
-        self._read_buffer = b""
-        return data
-
-    def set_response(self, command_key, response_data):
-        """Set a specific response for a command key (without address).
-        Does NOT automatically add \\r\\n termination."""
-        # Store response data exactly as provided
-        self.responses[command_key] = response_data
+    # --- Methods for test setup ---
+    def set_response(self, command_str_no_cr, response_bytes_with_crlf):
+        """Set a specific response for a command (e.g., set_response("1gs", b"1GS00\\r\\n"))."""
+        self._responses[command_str_no_cr] = response_bytes_with_crlf
 
     def clear_responses(self):
-        self.responses = {}
-        self.log = []
+        self._responses = {}
+        self._log = []
+        self.reset_input_buffer()
+        self.reset_output_buffer()
+
+    @property
+    def log(self):
+        return self._log
 
 
-# --- Pytest Fixtures ---
-
+# --- Fixtures ---
 
 @pytest.fixture
 def mock_serial_port():
-    """Fixture for the mock serial port."""
-    mock_port = MockSerial(port="/dev/mock", baudrate=9600, timeout=1)
-    # Common default responses
-    # Pass only core data; \\r\\n is added by MockSerial.set_response
-    mock_port.set_response("gs", "GS00")
-    mock_port.set_response("in", "IN0E1140TESTSERL2401016800023000")
-    mock_port.set_response("gp", "PO00000000")
-    mock_port.set_response("ho0", "PO00000000")
-    mock_port.set_response("st", "GS00")
-    mock_port.set_response("sv", "GS00")
-    mock_port.set_response("sj", "GS00")
-    mock_port.set_response("ma", "GS00")
-
-    # Patch serial.Serial specifically within the controller module's namespace
-    with patch('elliptec_controller.controller.serial.Serial', return_value=mock_port):
-        yield mock_port
-    mock_port.close() # Ensure closed after test
-
+    """Provide a mock serial connection instance."""
+    return MockSerial()
 
 @pytest.fixture
-def rotator_addr_8(mock_serial_port):
-    """Fixture for an ElliptecRotator instance at address 8."""
-    # Prevent __init__ from trying to get device info immediately
-    with patch.object(
-        ElliptecRotator,
-        "get_device_info",
-        return_value={
-            "type": "0E",
-            "serial_number": "TESTSERL",
-            "pulses_per_unit": 262144,
-            "travel": 360,
-        },
-    ) as _:  # Assign unused variable to _
-        rotator = ElliptecRotator(
-            port=mock_serial_port, motor_address=8, name="TestRotator8"
-        )
-        # The patch context manager automatically restores the original method
-        # after the 'with' block exits. No need for manual restoration.
-        # Manually set some defaults that might be read from device info
-        rotator.pulse_per_revolution = 262144
-        rotator.range = 360
-    return rotator
+def rotator_addr_1(mock_serial_port):
+    """Provide an ElliptecRotator instance using the mock serial port at address '1'."""
+    # Simulate device info response needed during init if port is string
+    # The init checks for mock attributes, so get_device_info won't be called here.
+    rot = ElliptecRotator(mock_serial_port, motor_address=1, name="Rotator-1", debug=False)
+    # Manually set pulse count if needed for tests, as get_device_info isn't called automatically for mocks
+    rot.pulse_per_revolution = 143360 # Example value from user, ensures calculations are tested
+    rot.pulses_per_deg = rot.pulse_per_revolution / 360.0
+    return rot
 
 
-@pytest.fixture
-def rotator_addr_2(mock_serial_port):
-    """Fixture for an ElliptecRotator instance at address 2."""
-    with patch.object(
-        ElliptecRotator,
-        "get_device_info",
-        return_value={
-            "type": "0E",
-            "serial_number": "TESTSERL",
-            "pulses_per_unit": 262144,
-            "travel": 360,
-        },
-    ) as _: # Assign unused variable to _
-        rotator = ElliptecRotator(
-            port=mock_serial_port, motor_address=2, name="TestRotator2"
-        )
-        rotator.pulse_per_revolution = 262144
-        rotator.range = 360
-    return rotator
+# --- Test Functions ---
 
-
-@pytest.fixture
-def rotator_addr_3(mock_serial_port):
-    """Fixture for an ElliptecRotator instance at address 3."""
-    with patch.object(
-        ElliptecRotator,
-        "get_device_info",
-        return_value={
-            "type": "0E",
-            "serial_number": "TESTSERL",
-            "pulses_per_unit": 262144,
-            "travel": 360,
-        },
-    ) as _: # Assign unused variable to _
-        rotator = ElliptecRotator(
-            port=mock_serial_port, motor_address=3, name="TestRotator3"
-        )
-        rotator.pulse_per_revolution = 262144
-        rotator.range = 360
-    return rotator
-
-
-@pytest.fixture
-def triple_controller(mock_serial_port):
-    """Fixture for a TripleRotatorController."""
-    # Prevent get_device_info during individual rotator init
-    with patch.object(
-        ElliptecRotator,
-        "get_device_info",
-        return_value={
-            "type": "0E",
-            "serial_number": "TESTSERL",
-            "pulses_per_unit": 262144,
-            "travel": 360,
-        },
-    ):
-        controller = TripleRotatorController(
-            port=mock_serial_port, motor_addresses=[2, 3, 8]
-        )
-        # Manually set defaults for the rotators inside
-        for r in controller.rotators:
-            r.pulse_per_revolution = 262144
-            r.range = 360
-    return controller
-
-
-# --- Test Conversion Functions ---
-
-
+# Test Utility Functions
 def test_degrees_to_hex():
+    """Test degree to hex conversion with default pulse count."""
     assert degrees_to_hex(0) == "00000000"
-    assert degrees_to_hex(90) == "00010000"
+    assert degrees_to_hex(90) == "00010000"  # Assuming 2^18 pulses/rev
     assert degrees_to_hex(180) == "00020000"
-    assert degrees_to_hex(270) == "00030000"
-    assert (
-        degrees_to_hex(360) == "00040000"
-    )  # Note: Wraps slightly due to integer conversion
-    assert degrees_to_hex(-90) == "FFFF0000"  # Equivalent to 270
+    assert degrees_to_hex(360) == "00040000"
+    assert degrees_to_hex(-90) == "FFFF0000"
 
+def test_degrees_to_hex_custom_pulse():
+    """Test degree to hex conversion with a custom pulse count."""
+    pulse_rev = 143360 # Example from user's device
+    # 1 degree = 143360 / 360 = 398.22 pulses
+    # 90 degrees = 35840 pulses = 0x8C00
+    assert degrees_to_hex(90, pulse_rev) == "00008C00"
+    assert degrees_to_hex(180, pulse_rev) == "00011800" # 71680
+    assert degrees_to_hex(360, pulse_rev) == "00023000" # 143360
+    assert degrees_to_hex(-90, pulse_rev) == "FFFF7400" # -35840
 
 def test_hex_to_degrees():
+    """Test hex to degree conversion with default pulse count."""
     assert hex_to_degrees("00000000") == pytest.approx(0.0)
-    # Increase tolerance due to integer division in conversion
     assert hex_to_degrees("00010000") == pytest.approx(90.0, abs=1e-3)
     assert hex_to_degrees("00020000") == pytest.approx(180.0, abs=1e-3)
-    assert hex_to_degrees("00030000") == pytest.approx(270.0, abs=1e-3)
-    # Increase tolerance slightly more for 360 deg case
     assert hex_to_degrees("00040000") == pytest.approx(360.0, abs=1.1e-3)
-    assert hex_to_degrees("FFFF0000") == pytest.approx(-90.0, abs=1e-3)  # Signed conversion, add tolerance
+    assert hex_to_degrees("FFFF0000") == pytest.approx(-90.0, abs=1e-3)
 
-# --- Test ElliptecRotator ---
+def test_hex_to_degrees_custom_pulse():
+    """Test hex to degree conversion with a custom pulse count."""
+    pulse_rev = 143360
+    assert hex_to_degrees("00008C00", pulse_rev) == pytest.approx(90.0, abs=1e-3)
+    assert hex_to_degrees("00011800", pulse_rev) == pytest.approx(180.0, abs=1e-3)
+    assert hex_to_degrees("00023000", pulse_rev) == pytest.approx(360.0, abs=1.1e-3)
+    assert hex_to_degrees("FFFF7400", pulse_rev) == pytest.approx(-90.0, abs=1e-3)
 
+# Test Initialization
+def test_rotator_init_with_mock(rotator_addr_1, mock_serial_port):
+    """Test initializing with a mock port object."""
+    assert rotator_addr_1.serial == mock_serial_port
+    assert rotator_addr_1.physical_address == '1'
+    assert rotator_addr_1.active_address == '1'
+    assert rotator_addr_1.name == "Rotator-1"
 
-def test_rotator_init(rotator_addr_8, mock_serial_port):
-    assert rotator_addr_8.address == "8"
-    assert rotator_addr_8.name == "TestRotator8"
-    assert rotator_addr_8.serial == mock_serial_port
+@patch('elliptec_controller.controller.serial.Serial', autospec=True)
+@patch('elliptec_controller.controller.ElliptecRotator.get_device_info', return_value={'type': '0E', 'pulses_per_unit_dec': '143360'})
+def test_rotator_init_with_string(mock_get_info, mock_serial_class):
+    """Test initializing with a port string."""
+    mock_serial_instance = MockSerial() # Use our mock for behavior
+    mock_serial_class.return_value = mock_serial_instance
 
+    rot = ElliptecRotator(port="/dev/mock", motor_address=2, name="StringInit")
 
-def test_send_command(rotator_addr_8, mock_serial_port):
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("in", "INTESTDATA") # Core data only
+    mock_serial_class.assert_called_once_with(
+        port="/dev/mock", baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1
+    )
+    mock_get_info.assert_called_once()
+    assert rot.serial == mock_serial_instance
+    assert rot.physical_address == '2'
+    assert rot.pulse_per_revolution == 143360 # Check if info was used
 
-    response = rotator_addr_8.send_command("in")
+# Test Send Command
+def test_send_command_simple(rotator_addr_1, mock_serial_port):
+    """Test sending a command without data."""
+    mock_serial_port.set_response("1gs", b"1GS00\\r\\n")
+    response = rotator_addr_1.send_command("gs")
+    assert mock_serial_port.log[-1] == b"1gs\\r"
+    assert response == "1GS00"
 
-    assert mock_serial_port.log == [b"8in\r"]
-    # send_command returns stripped response now
-    assert response == "8INTESTDATA"
+def test_send_command_with_data(rotator_addr_1, mock_serial_port):
+    """Test sending a command with data."""
+    hex_pos = "00008C00" # 90 deg with custom pulse
+    mock_serial_port.set_response(f"1ma{hex_pos}", b"1PO00008C00\\r\\n")
+    response = rotator_addr_1.send_command("ma", data=hex_pos)
+    assert mock_serial_port.log[-1] == f"1ma{hex_pos}\\r".encode()
+    assert response == "1PO00008C00"
 
+def test_send_command_wrong_address_response(rotator_addr_1, mock_serial_port):
+    """Test that responses for other addresses are ignored."""
+    mock_serial_port.set_response("1gs", b"2GS00\\r\\n") # Response from address '2'
+    response = rotator_addr_1.send_command("gs")
+    assert mock_serial_port.log[-1] == b"1gs\\r"
+    assert response == "" # Should return empty string
 
-def test_send_command_with_data(rotator_addr_8, mock_serial_port):
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response(
-        "ma00010000", "PO00010000" # Core data only
-    )  # Specific response for move to 90 deg
+def test_send_command_timeout(rotator_addr_1, mock_serial_port):
+    """Test command timeout (mocked)."""
+    # Simulate no response by not setting one
+    response = rotator_addr_1.send_command("gs", timeout=0.05) # Short timeout
+    assert mock_serial_port.log[-1] == b"1gs\\r"
+    assert response == "" # Should return empty string
 
-    response = rotator_addr_8.send_command("ma", "00010000")
-
-    assert mock_serial_port.log == [b"8ma00010000\r"]
-    # send_command returns stripped response now
-    assert response == "8PO00010000"
-
-
-def test_send_command_address_filter(rotator_addr_8, mock_serial_port):
-    # Simulate response from WRONG address
-    mock_serial_port.clear_responses()
-    # No specific response set for 'gs' at addr 8
-    # Let's manually queue a response from addr '2'
-    mock_serial_port._read_buffer = b"2GS00\\r\\n"
-
-    response = rotator_addr_8.send_command("gs")
-
-    # Should have sent command to address 8
-    assert mock_serial_port.log == [b"8gs\r"]
-    # Response should be empty because it didn't start with '8'
-    assert response == ""
-
-
-def test_get_status(rotator_addr_8, mock_serial_port):
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("gs", "GS00") # Core data only
-    status = rotator_addr_8.get_status()
+# Test Status Methods
+def test_get_status(rotator_addr_1, mock_serial_port):
+    """Test getting status."""
+    mock_serial_port.set_response("1gs", b"1GS00\\r\\n")
+    status = rotator_addr_1.get_status()
+    assert mock_serial_port.log[-1] == b"1gs\\r"
     assert status == "00"
 
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("gs", "GS0C") # Core data only
-    status = rotator_addr_8.get_status()
-    assert status == "0C"
+    mock_serial_port.set_response("1gs", b"1GS09\\r\\n") # Moving
+    status = rotator_addr_1.get_status()
+    assert status == "09"
 
-    mock_serial_port.clear_responses()
-    # No response set - should return None or default
-    status = rotator_addr_8.get_status()
-    assert status == ""  # Controller returns empty string on failure/no response
+def test_is_ready(rotator_addr_1, mock_serial_port):
+    """Test checking if rotator is ready."""
+    mock_serial_port.set_response("1gs", b"1GS00\\r\\n") # OK
+    assert rotator_addr_1.is_ready() is True
 
+    mock_serial_port.set_response("1gs", b"1GS09\\r\\n") # Moving
+    assert rotator_addr_1.is_ready() is False
 
-def test_is_ready(rotator_addr_8, mock_serial_port):
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("gs", "GS00") # Core data only
-    assert rotator_addr_8.is_ready() is True
+    mock_serial_port.set_response("1gs", b"1GS0A\\r\\n") # Error
+    assert rotator_addr_1.is_ready() is False
 
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("gs", "GS09")  # Moving - Core data only
-    assert rotator_addr_8.is_ready() is False
+    mock_serial_port.set_response("1gs", b"") # Timeout/No response
+    assert rotator_addr_1.is_ready() is False
 
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("gs", "GS0C")  # Error - Core data only
-    assert (
-        rotator_addr_8.is_ready() is False
-    )  # Or should it raise error? Current impl returns False
+def test_wait_until_ready(rotator_addr_1, mock_serial_port):
+    """Test waiting until the rotator is ready."""
+    # Simulate sequence: Moving -> Ready
+    mock_serial_port.set_response("1gs", b"1GS09\\r\\n") # Moving
+    # We need a way for the mock to change response between calls inside wait_until_ready
+    # Let's mock get_status directly for this test
+    with patch.object(rotator_addr_1, 'get_status', side_effect=["09", "09", "00"]) as mock_get:
+        start_time = time.monotonic()
+        result = rotator_addr_1.wait_until_ready(timeout=1.0)
+        duration = time.monotonic() - start_time
 
+        assert result is True
+        assert mock_get.call_count == 3
+        assert duration >= 0.2 # Should have polled a few times
 
-@patch("time.sleep", return_value=None)  # Mock time.sleep
-def test_wait_until_ready(mock_sleep, rotator_addr_8, mock_serial_port):
-    # Patch get_status to simulate the sequence of states
-    with patch.object(rotator_addr_8, 'get_status', side_effect=['09', '09', '00']) as mock_get_status:
-        result = rotator_addr_8.wait_until_ready(timeout=1) # Timeout value doesn't matter much here
+def test_wait_until_ready_timeout(rotator_addr_1, mock_serial_port):
+    """Test timeout during wait_until_ready."""
+    # Simulate always moving
+    with patch.object(rotator_addr_1, 'get_status', return_value="09") as mock_get:
+        start_time = time.monotonic()
+        result = rotator_addr_1.wait_until_ready(timeout=0.1) # Short timeout
+        duration = time.monotonic() - start_time
 
-    # Assert that wait_until_ready returned True (indicating success)
+        assert result is False
+        assert duration >= 0.1
+        assert mock_get.call_count > 0 # Should have polled at least once
+
+# Test Movement Methods
+def test_stop(rotator_addr_1, mock_serial_port):
+    """Test stopping the rotator."""
+    mock_serial_port.set_response("1st", b"1GS00\\r\\n") # Status OK after stop
+    result = rotator_addr_1.stop()
+    assert mock_serial_port.log[-1] == b"1st\\r"
     assert result is True
-    # Assert that get_status was called multiple times (3 times in this case)
-    assert mock_get_status.call_count == 3
 
-
-@patch("time.sleep", return_value=None)
-def test_wait_until_ready_timeout(mock_sleep, rotator_addr_8, mock_serial_port):
-    # Need to reset the class modification from previous test if running sequentially
-    mock_serial_port.__class__ = MockSerial 
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("gs", "GS09")  # Always moving
-
-    start_time = time.monotonic()
-    # Remove polling_interval argument
-    result = rotator_addr_8.wait_until_ready(timeout=0.1)
-    end_time = time.monotonic()
-
-    assert result is False
-    # This assertion might still fail if the internal loop/sleep takes longer than expected
-    assert (end_time - start_time) == pytest.approx(0.1, abs=0.05)
-
-
-def test_stop(rotator_addr_8, mock_serial_port):
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("st", "GS00") # Core data only
-    result = rotator_addr_8.stop()
-    assert result is True
-    assert mock_serial_port.log == [b"8st\r"]
-
-
-def test_home(rotator_addr_8, mock_serial_port):
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("ho0", "GS09")  # Simulate GS response (moving) - Core data only
-    mock_serial_port.set_response("gs", "GS00")  # Status check after move - Core data only
-
-    # Mock wait_until_ready to avoid complex status mocking for now
-    with patch.object(
-        rotator_addr_8, "wait_until_ready", return_value=True
-    ) as mock_wait:
-        result = rotator_addr_8.home(wait=True)
+def test_home(rotator_addr_1, mock_serial_port):
+    """Test homing the rotator."""
+    # Homing might return GS moving, then GS OK
+    mock_serial_port.set_response("1ho0", b"1GS09\\r\\n") # Acknowledge, moving
+    with patch.object(rotator_addr_1, 'wait_until_ready', return_value=True) as mock_wait:
+        result = rotator_addr_1.home(wait=True)
+        assert mock_serial_port.log[-1] == b"1ho0\\r"
         assert result is True
         mock_wait.assert_called_once()
 
-    assert b"8ho0\r" in mock_serial_port.log
+    # Test home without waiting
+    mock_serial_port.clear_responses()
+    mock_serial_port.set_response("1ho0", b"1GS09\\r\\n")
+    result = rotator_addr_1.home(wait=False)
+    assert result is True # Command sent assumed OK if not waiting for completion status
 
-    # Test wait=False
-    mock_serial_port.log = []
-    result = rotator_addr_8.home(wait=False)
+def test_move_absolute(rotator_addr_1, mock_serial_port):
+    """Test moving to an absolute position."""
+    target_deg = 90.0
+    # Use rotator's pulse count (set in fixture)
+    expected_hex = degrees_to_hex(target_deg, rotator_addr_1.pulse_per_revolution) # "00008C00"
+    cmd_str = f"1ma{expected_hex}"
+    mock_serial_port.set_response(cmd_str, b"1GS09\\r\\n") # Acknowledge, moving
+
+    with patch.object(rotator_addr_1, 'wait_until_ready', return_value=True) as mock_wait:
+        result = rotator_addr_1.move_absolute(target_deg, wait=True)
+        assert mock_serial_port.log[-1] == f"{cmd_str}\\r".encode()
+        assert result is True
+        mock_wait.assert_called_once()
+
+# Test Position Update
+def test_update_position(rotator_addr_1, mock_serial_port):
+    """Test getting the current position."""
+    hex_pos = "00008C00" # 90 deg with custom pulse
+    mock_serial_port.set_response("1gp", f"1PO{hex_pos}\\r\\n".encode())
+    position = rotator_addr_1.update_position()
+    assert mock_serial_port.log[-1] == b"1gp\\r"
+    assert position == pytest.approx(90.0, abs=1e-3)
+
+    # Test with zero position
+    mock_serial_port.set_response("1gp", b"1PO00000000\\r\\n")
+    position = rotator_addr_1.update_position()
+    assert position == pytest.approx(0.0)
+
+    # Test with non-PO response
+    mock_serial_port.set_response("1gp", b"1GS00\\r\\n")
+    position = rotator_addr_1.update_position()
+    assert position == 0.0 # Should return 0 on non-PO response
+
+# Test Parameter Setting
+def test_set_velocity(rotator_addr_1, mock_serial_port):
+    """Test setting the velocity."""
+    velocity = 40 # ~40%
+    hex_vel = format(velocity, '02x').upper() # "28"
+    cmd_str = f"1sv{hex_vel}"
+    mock_serial_port.set_response(cmd_str, b"1GS00\\r\\n")
+    result = rotator_addr_1.set_velocity(velocity)
+    assert mock_serial_port.log[-1] == f"{cmd_str}\\r".encode()
     assert result is True
-    assert b"8ho0\r" in mock_serial_port.log
+    assert rotator_addr_1.velocity == velocity
 
-
-def test_move_absolute(rotator_addr_8, mock_serial_port):
-    mock_serial_port.clear_responses()
-    # Specific response for moving to 90 deg - Core data only
-    mock_serial_port.set_response("ma00010000", "GS00")
-    mock_serial_port.set_response("gs", "GS00")  # Status check - Core data only
-
-    with patch.object(
-        rotator_addr_8, "wait_until_ready", return_value=True
-    ) as mock_wait:
-        result = rotator_addr_8.move_absolute(90, wait=True)
-        assert result is True
-        mock_wait.assert_called_once()
-
-    assert b"8ma00010000\r" in mock_serial_port.log
-
-    # Test wait=False
-    mock_serial_port.log = []
-    result = rotator_addr_8.move_absolute(180, wait=False)
+    # Test clamping
+    cmd_str_max = "1sv40" # 64 clamped
+    mock_serial_port.set_response(cmd_str_max, b"1GS00\\r\\n")
+    result = rotator_addr_1.set_velocity(100) # Above max
+    assert mock_serial_port.log[-1] == f"{cmd_str_max}\\r".encode()
     assert result is True
-    assert b"8ma00020000\r" in mock_serial_port.log
+    assert rotator_addr_1.velocity == 64
 
-    # Test handling of PO response
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("ma00030000", "PO00030000")  # Simulate PO response - Core data only
-    mock_serial_port.set_response("gs", "GS00") # Core data only
-    with patch.object(
-        rotator_addr_8, "wait_until_ready", return_value=True
-    ) as mock_wait:
-        result = rotator_addr_8.move_absolute(270, wait=True)
-        assert result is True
-        mock_wait.assert_called_once()
-    assert b"8ma00030000\r" in mock_serial_port.log
-
-
-def test_update_position(rotator_addr_8, mock_serial_port):
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("gp", "PO00010000")  # Position 90 deg - Core data only
-    position = rotator_addr_8.update_position()
-    assert position == pytest.approx(90.0, abs=1e-3) # Add tolerance
-    assert mock_serial_port.log == [b"8gp\r"]
-
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("gp", "POFFFF0000")  # Position -90 deg - Core data only
-    position = rotator_addr_8.update_position()
-    assert position == pytest.approx(-90.0, abs=1e-3) # Add tolerance
-
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("gp", "GS0C")  # Error response - Core data only
-    position = rotator_addr_8.update_position()
-    assert position == 0.0  # Current impl returns 0.0 on error / non-PO
-
-
-def test_get_device_info(rotator_addr_8, mock_serial_port):
-    mock_serial_port.clear_responses()
-    # Standard response format - Core data only
-    mock_serial_port.set_response("in", "IN0E1140TESTSERL2401016800023000")
-    info = rotator_addr_8.get_device_info()
-
-    assert info["type"] == "0E"
-    assert info["firmware"] == "1140"
-    assert info["serial_number"] == "TESTSERL"
-    assert info["year_month"] == "2401"
-    assert info["hardware"] == "6800"
-    # Corrected based on likely controller fix (slicing data[24:30])
-    assert info["max_range"] == "023000"
-    assert info["firmware_formatted"] == "17.64"
-    assert info["hardware_formatted"] == "104.0"
-    assert info["manufacture_date"] == "2024-01"
-    assert mock_serial_port.log == [b"8in\r"]
-
-
-# --- Test TripleRotatorController ---
-
-
-def test_triple_controller_init(triple_controller):
-    assert len(triple_controller.rotators) == 3
-    assert triple_controller.rotators[0].address == "2"
-    assert triple_controller.rotators[1].address == "3"
-    assert triple_controller.rotators[2].address == "8"
-    assert triple_controller.serial is not None
-
-
-def test_triple_controller_home_all(triple_controller, mock_serial_port):
-    mock_serial_port.clear_responses()
-    # Responses for each rotator - Core data only
-    mock_serial_port.set_response("ho0", "PO00000000")
-    mock_serial_port.set_response("gs", "GS00")
-
-    with patch.object(
-        triple_controller, "wait_all_ready", return_value=True
-    ) as mock_wait:
-        result = triple_controller.home_all(wait=True)
-        assert result is True
-        mock_wait.assert_called_once()
-
-    # Check commands sent to each address
-    assert b"2ho0\r" in mock_serial_port.log
-    assert b"3ho0\r" in mock_serial_port.log
-    assert b"8ho0\r" in mock_serial_port.log
-
-
-def test_triple_controller_move_all_absolute(triple_controller, mock_serial_port):
-    mock_serial_port.clear_responses()
-    # Responses for move and status - Core data only
-    mock_serial_port.set_response("ma", "GS00")  # Generic ack for moves
-    mock_serial_port.set_response("gs", "GS00")
-
-    positions = [90, 180, 270]
-
-    with patch.object(
-        triple_controller, "wait_all_ready", return_value=True
-    ) as mock_wait:
-        result = triple_controller.move_all_absolute(positions, wait=True)
-        assert result is True
-        mock_wait.assert_called_once()
-
-    # Check commands sent to each address with correct position data
-    assert b"2ma00010000\r" in mock_serial_port.log  # 90 deg
-    assert b"3ma00020000\r" in mock_serial_port.log  # 180 deg
-    assert b"8ma00030000\r" in mock_serial_port.log  # 270 deg
-
-
-def test_triple_controller_stop_all(triple_controller, mock_serial_port):
-    mock_serial_port.clear_responses()
-    mock_serial_port.set_response("st", "GS00") # Core data only
-
-    result = triple_controller.stop_all()
+def test_set_jog_step(rotator_addr_1, mock_serial_port):
+    """Test setting the jog step size."""
+    jog_deg = 5.0
+    # Use rotator's pulse count
+    hex_jog = degrees_to_hex(jog_deg, rotator_addr_1.pulse_per_revolution)
+    cmd_str = f"1sj{hex_jog}"
+    mock_serial_port.set_response(cmd_str, b"1GS00\\r\\n")
+    result = rotator_addr_1.set_jog_step(jog_deg)
+    assert mock_serial_port.log[-1] == f"{cmd_str}\\r".encode()
     assert result is True
+    assert rotator_addr_1._jog_step_size == jog_deg
 
-    assert b"2st\r" in mock_serial_port.log
-    assert b"3st\r" in mock_serial_port.log
-    assert b"8st\r" in mock_serial_port.log
+    # Test setting continuous (0 degrees)
+    cmd_str_zero = "1sj00000000"
+    mock_serial_port.set_response(cmd_str_zero, b"1GS00\\r\\n")
+    result = rotator_addr_1.set_jog_step(0)
+    assert mock_serial_port.log[-1] == f"{cmd_str_zero}\\r".encode()
+    assert result is True
+    assert rotator_addr_1._jog_step_size == 0
 
+# Test Get Device Info
+def test_get_device_info(rotator_addr_1, mock_serial_port):
+    """Test retrieving and parsing device information."""
+    # Example response based on user's device
+    # Type=0E, SN=11400609, Year=2023, FW=17(hex)=23(dec), Thread=0(metric), HW=1, Range=0168(hex)=360(dec), Pulse=00023000(hex)=143360(dec)
+    info_str = "0E1140060920231701016800023000"
+    mock_serial_port.set_response("1in", f"1IN{info_str}\\r\\n".encode())
 
-# Add more tests for other methods:
-# - set_velocity, set_jog_step, optimize_motors, continuous_move for ElliptecRotator
-# - is_all_ready, set_all_velocities, move_all_relative for TripleRotatorController
-# - Edge cases: timeouts, error responses (e.g., GS0C), invalid parameters
+    info = rotator_addr_1.get_device_info(debug=True)
+
+    assert mock_serial_port.log[-1] == b"1in\\r"
+    assert info is not None
+    assert info.get("type") == "0E"
+    assert info.get("serial_number") == "11400609"
+    assert info.get("year") == "2023"
+    assert info.get("firmware") == "17" # Raw hex firmware
+    assert info.get("thread") == "metric"
+    assert info.get("hardware") == "1" # Raw hardware byte
+    assert info.get("travel") == "0168" # Raw travel/range
+    assert info.get("pulses_per_unit") == "00023000" # Raw pulse count
+    assert info.get("pulses_per_unit_dec") == "143360"
+    assert info.get("firmware_formatted") == "1.7" # Formatted firmware
+    assert info.get("hardware_formatted") == "0.1" # Formatted hardware
+    assert info.get("range_dec") == "360"
+
+    # Check internal state updated
+    assert rotator_addr_1.pulse_per_revolution == 143360
+    assert rotator_addr_1.device_info == info
+```

@@ -446,7 +446,7 @@ class ElliptecRotator:
         """
         response = self.send_command(COMMAND_STOP)
         self.is_moving = False
-        return response and response.startswith(f"{self.address}GS")
+        return response and response.startswith(f"{self.active_address}GS")
 
     def home(self, wait: bool = True) -> bool:
         """
@@ -492,6 +492,45 @@ class ElliptecRotator:
 
         return False
 
+    def get_velocity(self, debug: bool = False) -> Optional[int]:
+        """
+        Get the current velocity setting of the rotator.
+
+        Sends the 'gv' command and parses the 2-byte hexadecimal response.
+
+        Args:
+            debug (bool): Whether to print debug information.
+
+        Returns:
+            Optional[int]: The current velocity setting (0-64), or None if retrieval fails.
+        """
+        response = self.send_command(COMMAND_GET_VELOCITY, debug=debug)
+
+        expected_prefix = f"{self.active_address}GV"
+        if response and response.startswith(expected_prefix):
+            hex_vel = response[len(expected_prefix):].strip()
+            if len(hex_vel) == 2: # Expecting 2 hex characters
+                try:
+                    velocity_val = int(hex_vel, 16)
+                    # Clamp to expected range just in case device reports outside 0-64
+                    clamped_velocity = max(0, min(velocity_val, 64))
+                    if debug:
+                        print(f"{self.name}: Retrieved velocity hex: {hex_vel}, decimal: {velocity_val}, clamped: {clamped_velocity}")
+                    # Update internal state as well? Maybe not, just report what device says.
+                    # self.velocity = clamped_velocity
+                    return clamped_velocity
+                except ValueError:
+                    if debug:
+                        print(f"{self.name}: Failed to parse velocity hex: '{hex_vel}'")
+                    return None
+            elif debug:
+                print(f"{self.name}: Unexpected velocity response format (length): '{response}'")
+                return None
+        elif debug:
+            print(f"{self.name}: No valid velocity response or error in send_command. Response: '{response}'")
+
+        return None
+
     def set_velocity(self, velocity: int) -> bool:
         """
         Set the velocity of the rotator.
@@ -529,7 +568,7 @@ class ElliptecRotator:
         # Update internal velocity state if command was likely accepted
         # The actual check is the response, but we'll update optimistically for now
         # or rely on get_velocity if needed later.
-        self.velocity = velocity_val
+        self.velocity = self.get_velocity()
 
         # Check response - according to manual, device responds with GS (status)
         if response and response.startswith(f"{self.active_address}GS"):
@@ -881,7 +920,7 @@ class ElliptecRotator:
         response = self.send_command(COMMAND_OPTIMIZE_MOTORS)
 
         # Device should respond with GS status. Optimization starts in background.
-        if response and response.startswith(f"{self.address}GS"):
+        if response and response.startswith(f"{self.physical_address}GS"):
             # Status might initially indicate busy (e.g., '0A')
             if wait:
                 print(
@@ -899,133 +938,6 @@ class ElliptecRotator:
             f"Failed to start motor optimization on {self.name}. Response: {response}"
         )
         return False
-
-    def configure_as_group_slave(
-        self,
-        master_address_to_listen_to: str,
-        slave_offset: float = 0.0,
-        debug: bool = False,
-    ) -> bool:
-        """
-        Instruct this rotator (slave) to listen to a master_address.
-        Used for synchronized group movements.
-
-        Args:
-            master_address_to_listen_to (str): The address this rotator should listen to (0-F).
-            slave_offset (float): Angular offset in degrees for this slave rotator.
-            debug (bool): Whether to print debug information.
-
-        Returns:
-            bool: True if configuration was successful.
-        """
-        try:
-            int(master_address_to_listen_to, 16)
-            if len(master_address_to_listen_to) != 1:
-                raise ValueError("Master address must be a single hex character.")
-        except ValueError:
-            if debug:
-                print(
-                    f"Invalid master_address_to_listen_to: '{master_address_to_listen_to}'. Must be 0-F."
-                )
-            return False
-
-        if debug:
-            print(
-                f"Configuring {self.name} (phys_addr: {self.physical_address}) to listen to master_addr: {master_address_to_listen_to} with offset: {slave_offset} deg."
-            )
-
-        # Command: <physical_address_of_slave>ga<master_address_to_listen_to>
-        # Reply expected from: <master_address_to_listen_to>GS<status>
-        response = self.send_command(
-            command=COMMAND_GROUP_ADDRESS,  # Explicitly name the 'command' parameter
-            data=master_address_to_listen_to,
-            send_addr_override=self.physical_address,  # Send command using its physical address
-            expect_reply_from_addr=master_address_to_listen_to,  # Reply comes from the new address
-            debug=debug,
-            timeout_multiplier=1.5,  # Give 'ga' a bit more time for response
-        )
-
-        if (
-            response
-            and response.startswith(f"{master_address_to_listen_to}GS")
-            and "00" in response
-        ):  # Check for "00" status
-            self.active_address = master_address_to_listen_to
-            self.group_offset_degrees = slave_offset
-            self.is_slave_in_group = True
-            if debug:
-                print(
-                    f"{self.name} successfully configured as slave. Active_addr: {self.active_address}, Offset: {self.group_offset_degrees}"
-                )
-            return True
-        else:
-            if debug:
-                print(
-                    f"Failed to configure {self.name} as slave. Response: {response}"
-                )
-            # Attempt to revert to physical address if partial failure, though device might be in unknown state
-            self.active_address = self.physical_address
-            self.is_slave_in_group = False
-            self.group_offset_degrees = 0.0
-            return False
-
-        def revert_from_group_slave(self, debug: bool = False) -> bool:
-            """
-            Revert this rotator from slave mode back to its physical address.
-
-            Args:
-                debug (bool): Whether to print debug information.
-
-            Returns:
-                bool: True if reversion was successful.
-            """
-            if not self.is_slave_in_group:
-                if debug:
-                    print(
-                        f"{self.name} is not in slave group mode. No reversion needed."
-                    )
-                self.active_address = self.physical_address  # Ensure consistency
-                self.group_offset_degrees = 0.0
-                return True
-
-            current_listening_address = self.active_address
-            if debug:
-                print(
-                    f"Reverting {self.name} from listening to {current_listening_address} back to physical_addr: {self.physical_address}."
-                )
-
-            # Command: <current_listening_address>ga<physical_address_of_this_rotator>
-            # Reply expected from: <physical_address_of_this_rotator>GS<status>
-            response = self.send_command(
-                command=COMMAND_GROUP_ADDRESS,  # Explicitly name the 'command' parameter
-                data=self.physical_address,
-                send_addr_override=current_listening_address,  # Command is sent to the address it's currently listening on
-                expect_reply_from_addr=self.physical_address,  # Reply comes from its physical address
-                debug=debug,
-                timeout_multiplier=1.5,  # Give 'ga' a bit more time for response
-            )
-
-            # Always reset internal state regardless of response to avoid being stuck
-            self.active_address = self.physical_address
-            self.is_slave_in_group = False
-            self.group_offset_degrees = 0.0
-
-            if (
-                response
-                and response.startswith(f"{self.physical_address}GS")
-                and "00" in response
-            ):  # Check for "00" status
-                if debug:
-                    print(
-                        f"{self.name} successfully reverted to physical address {self.physical_address}."
-                    )
-                return True
-            else:
-                if debug:
-                    print(
-                        f"Failed to revert {self.name} to physical address. Response: {response}. Internal state reset."
-                    )
-                return False
 
     def get_device_info(self, debug: bool = False) -> Dict[str, str]:
         """
