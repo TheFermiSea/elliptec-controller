@@ -23,7 +23,7 @@ from .controller import (
     COMMAND_SET_JOG_STEP,
     COMMAND_GET_JOG_STEP,
     COMMAND_GET_INFO,
-    COMMAND_FREQUENCY_SEARCH
+    COMMAND_OPTIMIZE_MOTORS
 )
 
 __all__ = [
