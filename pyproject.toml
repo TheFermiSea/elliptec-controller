@@ -10,7 +10,10 @@ authors = [{ name = "Brian Squires", email = "squires.b@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.6"
 license = { file = "LICENSE" }
-dependencies = ["pyserial>=3.5"]
+dependencies = [
+    "ptpython>=3.0.7",
+    "pyserial>=3.5",
+]
 urls = { repository = "https://github.com/TheFermiSea/elliptec-controller" }
 
 [project.optional-dependencies]

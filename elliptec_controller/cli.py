@@ -7,7 +7,6 @@ This script provides basic command-line control of Elliptec rotators.
 
 import argparse
 import sys
-import time
 from elliptec_controller import TripleRotatorController
 
 
@@ -32,8 +31,8 @@ def parse_args():
                             help='Specific rotator to home (by index, 0-based)')
     
     # Status command
-    status_parser = subparsers.add_parser('status', help='Get rotator status')
-    
+    _status_parser = subparsers.add_parser('status', help='Get rotator status')
+
     # Move absolute command
     move_abs_parser = subparsers.add_parser('move-abs', help='Move to absolute position')
     move_abs_parser.add_argument('--rotator', '-r', type=int, required=True,

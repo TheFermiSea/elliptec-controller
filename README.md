@@ -76,6 +76,28 @@ ser.close()
 
 For detailed documentation on all available commands and features, please refer to the [Thorlabs Elliptec documentation](https://www.thorlabs.com/newgrouppage9.cfm?objectgroup_id=9252) and the docstrings within the code.
 
+## Testing
+
+The test suite uses `pytest` and mocks serial communication. To run the tests:
+
+1.  **Install test dependencies:** Make sure `pytest` and `pyserial` are available. If defined in `pyproject.toml` under `[project.optional-dependencies.test]`, you can install them using:
+    ```bash
+    # If using standard pip/venv
+    pip install -e .[test]
+
+    # If using uv
+    uv pip install -e .[test]
+    ```
+    Alternatively, install manually: `pip install pytest pyserial` or `uv pip install pytest pyserial`.
+
+2.  **Run pytest:** Navigate to the project root directory (`elliptec-controller`) and run:
+    ```bash
+    pytest tests/
+
+    # Or, if using uv to manage the environment:
+    uv run pytest tests/
+    ```
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

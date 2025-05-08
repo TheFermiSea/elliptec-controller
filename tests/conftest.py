@@ -5,7 +5,6 @@ This file contains configuration and fixtures for pytest when running tests
 for the elliptec_controller package.
 """
 
-import pytest
 import os
 import sys
 

@@ -12,7 +12,7 @@ Protocol details based on the Thorlabs Elliptec documentation.
 import serial
 import time
 import threading
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Dict, List, Optional, Union, Any
 
 
 # Motor command constants - based on ELLx protocol manual
@@ -256,16 +256,21 @@ class ElliptecRotator:
                     )
                 return ""  # Return empty string if address doesn't match or no (valid) response
 
-    def get_status(self) -> str:
+    def get_status(self, timeout_override: Optional[float] = None) -> str:
         """
         Get the current status of the rotator.
+
+        Args:
+            timeout_override: Optional timeout value to pass to send_command.
 
         Returns:
             str: Status code (e.g., "00" for OK, "09" for moving), or empty string on error.
         """
-        response = self.send_command(
-            COMMAND_GET_STATUS
-        )  # send_command uses internal timeout
+        # Determine timeout for send_command
+        # Use override if provided, otherwise send_command uses its default (1.0s for non-move commands)
+        timeout = timeout_override if timeout_override is not None else 1.0
+
+        response = self.send_command(COMMAND_GET_STATUS, timeout=timeout)
         # Response from send_command is already stripped and address-checked
         if response and response.startswith(f"{self.address}GS"):
             # Extract the status code part and explicitly strip
@@ -303,8 +308,12 @@ class ElliptecRotator:
         """
         start_time = time.time()
 
+        # Define a short timeout for polling status checks within the loop
+        polling_timeout = 0.1 # seconds
+
         while (time.time() - start_time) < timeout:
-            if self.is_ready():
+            # Pass the short polling timeout to the status check
+            if self.is_ready(status_check_timeout=polling_timeout):
                 self.is_moving = False
                 return True
             time.sleep(0.1)
@@ -334,7 +343,6 @@ class ElliptecRotator:
         Returns:
             bool: True if the homing command was executed successfully
         """
-        initial_status = self.get_status()
         # Send "ho" command with "0" parameter as per protocol manual
         response = self.send_command(COMMAND_HOME, data="0")
         self.is_moving = True
@@ -436,7 +444,7 @@ class ElliptecRotator:
             jog_data = degrees_to_hex(degrees)
 
         # Send command
-        response = self.send_command(COMMAND_JOG_STEP, data=jog_data)
+        response = self.send_command(COMMAND_SET_JOG_STEP, data=jog_data)
 
         return response and response.startswith(f"{self.address}GS")
 

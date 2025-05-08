@@ -2,7 +2,7 @@
 import pytest
 import serial
 import time
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch
 
 # Attempt to import from the controller module
 # Need to handle potential import errors if controller.py itself is broken
@@ -152,7 +152,7 @@ def rotator_addr_8(mock_serial_port):
             "pulses_per_unit": 262144,
             "travel": 360,
         },
-    ) as mock_get_info:
+    ) as _:  # Assign unused variable to _
         rotator = ElliptecRotator(
             port=mock_serial_port, motor_address=8, name="TestRotator8"
         )
@@ -176,7 +176,7 @@ def rotator_addr_2(mock_serial_port):
             "pulses_per_unit": 262144,
             "travel": 360,
         },
-    ):
+    ) as _: # Assign unused variable to _
         rotator = ElliptecRotator(
             port=mock_serial_port, motor_address=2, name="TestRotator2"
         )
@@ -197,7 +197,7 @@ def rotator_addr_3(mock_serial_port):
             "pulses_per_unit": 262144,
             "travel": 360,
         },
-    ):
+    ) as _: # Assign unused variable to _
         rotator = ElliptecRotator(
             port=mock_serial_port, motor_address=3, name="TestRotator3"
         )
