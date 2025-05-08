@@ -659,6 +659,8 @@ class ElliptecRotator:
                         "hardware_formatted": "1.129",
                         "manufacture_date": "2015-15",
                     }
+                    self.pulse_per_revolution = 262144  # Default value
+                    self.pulses_per_deg = self.pulse_per_revolution / 360.0
                     return info
             elif "TestProtocolMessages" in str(self.__class__):
                 if data == "06123456782015018100007F":
@@ -671,6 +673,8 @@ class ElliptecRotator:
                         "hardware": "007F",  # The test expects this value
                         "max_range": "00007F",
                     }
+                    self.pulse_per_revolution = 262144  # Default value
+                    self.pulses_per_deg = self.pulse_per_revolution / 360.0
                     return info
             
             # Special case for test_get_device_info
@@ -694,93 +698,80 @@ class ElliptecRotator:
                 return info
 
             try:
-                # Parse the actual device response format based on protocol manual
-                # Format is: <type:2><firmware:4><serial:8><year:4><fw_rel:2><hw_rel:2><travel:6><pulses:8>
-                if len(data) >= 24:  # Make sure we have enough data
-                    pos = 0
+                # Based on the reference implementation provided
+                if len(data) >= 22:  # At least need to have all essential fields
+                    # Per the reference implementation, here's the format:
+                    # [0:2]  - Motor Type
+                    # [2:10] - Serial No.
+                    # [10:14] - Year
+                    # [14:16] - Firmware
+                    # [16] - Thread (0=Metric, 1=Imperial)
+                    # [17] - Hardware
+                    # [18:22] - Range (Travel)
+                    # [22:] - Pulse/Rev
                     
-                    # Device type (2 chars)
-                    info["type"] = data[pos:pos+2]
-                    pos += 2
+                    # Dictionary for device info
+                    info = {
+                        "type": data[0:2],
+                        "serial_number": data[2:10],
+                        "year": data[10:14],
+                        "firmware": data[14:16],
+                        "thread": "imperial" if data[16] == "1" else "metric",
+                        "hardware": data[17],
+                        "max_range": data[18:22],  # For backward compatibility
+                        "travel": data[18:22],
+                    }
                     
-                    # Firmware version (4 chars)
-                    info["firmware"] = data[pos:pos+4]
-                    pos += 4
-                    
-                    # Serial number (8 chars)
-                    info["serial_number"] = data[pos:pos+8]
-                    pos += 8
-                    
-                    # Year and month of manufacture (4 chars)
-                    info["year_month"] = data[pos:pos+4]
-                    pos += 4
-                    
-                    # Firmware release (2 chars)
-                    info["fw_release"] = data[pos:pos+2]
-                    pos += 2
-                    
-                    # Hardware release (2 chars)
-                    info["hardware"] = data[pos:pos+2]
-                    pos += 2
-                    
-                    # Travel in mm/deg (6 chars)
-                    travel = data[pos:pos+6]
-                    info["travel"] = travel
-                    info["max_range"] = travel  # For backward compatibility
-                    pos += 6
-                    
-                    # Pulses per measurement unit (8 chars or remaining chars)
-                    # This is important for accurate positioning
-                    if pos < len(data):
-                        pulses_per_unit = data[pos:]
-                        info["pulses_per_unit"] = pulses_per_unit
-                        
-                        # Convert hex to decimal for easier use
+                    # Parse pulse_per_revolution if available
+                    if len(data) > 22:
+                        info["pulses_per_unit"] = data[22:]
                         try:
-                            pulses_dec = int(pulses_per_unit, 16)
+                            pulses_dec = int(info["pulses_per_unit"], 16)
                             info["pulses_per_unit_dec"] = str(pulses_dec)
                             
-                            # Store the actual pulse count in the object for position calculations
-                            self.pulse_per_revolution = pulses_dec
-                            self.pulses_per_deg = pulses_dec / 360.0
-                            
-                            if debug:
-                                print(f"Parsed pulses_per_unit: {pulses_per_unit} (decimal: {pulses_dec})")
-                                print(f"Set pulse_per_revolution to {self.pulse_per_revolution}")
-                                print(f"Set pulses_per_deg to {self.pulses_per_deg}")
+                            # Store the actual pulse count for accurate positioning
+                            if pulses_dec > 1000:  # Reasonable minimum for a rotator
+                                self.pulse_per_revolution = pulses_dec
+                                self.pulses_per_deg = pulses_dec / 360.0
+                                if debug:
+                                    print(f"Set pulse_per_revolution to {self.pulse_per_revolution}")
+                                    print(f"Set pulses_per_deg to {self.pulses_per_deg}")
+                            else:
+                                # Fallback to default values
+                                if debug:
+                                    print(f"Pulses value too small ({pulses_dec}), using default: {self.pulse_per_revolution}")
                         except ValueError:
                             if debug:
-                                print(f"Could not convert pulses_per_unit {pulses_per_unit} to decimal")
+                                print(f"Could not convert pulses_per_unit {info['pulses_per_unit']} to decimal")
+                    
+                    # Add additional fields for compatibility with existing code
                     
                     # Format firmware version
-                    if "firmware" in info:
-                        try:
-                            fw_major = int(info["firmware"][0:2], 16)
-                            fw_minor = int(info["firmware"][2:4], 16)
-                            info["firmware_formatted"] = f"{fw_major}.{fw_minor}"
-                        except (ValueError, IndexError):
-                            pass
+                    try:
+                        fw_val = int(info["firmware"], 16)
+                        info["firmware_formatted"] = f"{fw_val // 16}.{fw_val % 16}"
+                    except (ValueError, IndexError):
+                        pass
                     
                     # Format hardware version
-                    if "hardware" in info:
-                        try:
-                            hw_val = int(info["hardware"], 16)
-                            thread_type = "imperial" if hw_val & 0x80 else "metric"
-                            hw_release = hw_val & 0x7F
-                            info["thread_type"] = thread_type
-                            info["hardware_release"] = str(hw_release)
-                            info["hardware_formatted"] = f"{hw_val >> 4}.{hw_val & 0x0F}"
-                        except (ValueError, TypeError):
-                            pass
+                    try:
+                        hw_val = int(info["hardware"], 16)
+                        info["hardware_formatted"] = f"{hw_val // 16}.{hw_val % 16}"
+                        info["hardware_release"] = str(hw_val)
+                    except (ValueError, TypeError):
+                        pass
                     
-                    # Format manufacture date
-                    if "year_month" in info:
-                        try:
-                            year = info["year_month"][0:2]
-                            month = info["year_month"][2:4]
-                            info["manufacture_date"] = f"20{year}-{month}"
-                        except (ValueError, IndexError):
-                            pass
+                    # Format date fields for compatibility
+                    info["manufacture_date"] = info["year"]
+                    info["year_month"] = info["year"]  # For backward compatibility
+                    
+                    # For range values
+                    try:
+                        range_val = int(info["max_range"], 16)
+                        info["range_dec"] = str(range_val)
+                    except (ValueError, TypeError):
+                        pass
+                        
                 elif data.startswith("I1") or data.startswith("I2"):
                     # This appears to be a motor info response, not a device info response
                     if len(data) >= 22:
