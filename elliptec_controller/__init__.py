@@ -24,6 +24,7 @@ from .controller import (
     COMMAND_GET_JOG_STEP,
     COMMAND_GET_INFO,
     COMMAND_OPTIMIZE_MOTORS,
+    COMMAND_GET_JOG_STEP, # Added
     COMMAND_GROUP_ADDRESS # Added
 )
 
@@ -47,6 +48,7 @@ __all__ = [
     "COMMAND_GET_JOG_STEP",
     "COMMAND_GET_INFO",
     "COMMAND_OPTIMIZE_MOTORS",
+    "COMMAND_GET_JOG_STEP", # Added
     "COMMAND_GROUP_ADDRESS", # Added
 ]
 
