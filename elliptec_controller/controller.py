@@ -178,7 +178,7 @@ class ElliptecRotator:
                 if 'pulses_per_unit_dec' in device_info:
                     self.pulse_per_revolution = int(device_info['pulses_per_unit_dec'])
                     self.pulses_per_deg = self.pulse_per_revolution / 360.0
-                
+
                 if debug and hasattr(self, "device_info"):
                     print(f"Device info for {self.name}: {self.device_info}")
                     if hasattr(self, "pulse_per_revolution"):
@@ -187,6 +187,40 @@ class ElliptecRotator:
                         )
                     if hasattr(self, "pulses_per_deg"):
                         print(f"Using pulses_per_deg: {self.pulses_per_deg}")
+                        
+                # Populate other attributes by querying the device
+                try:
+                    # Home the rotator
+                    if debug:
+                        print(f"Homing {self.name}...")
+                    home_result = self.home(wait=True)
+                    if not home_result and debug:
+                        print(f"Warning: Failed to home {self.name}")
+                    
+                    # Get current position
+                    if debug:
+                        print(f"Getting position for {self.name}...")
+                    self.update_position(debug=debug)
+                    
+                    # Get current velocity
+                    if debug:
+                        print(f"Getting velocity for {self.name}...")
+                    velocity = self.get_velocity(debug=debug)
+                    if velocity is not None:
+                        self.velocity = velocity
+                    
+                    # Get current jog step
+                    if debug:
+                        print(f"Getting jog step for {self.name}...")
+                    jog_step = self.get_jog_step(debug=debug)
+                    if jog_step is not None:
+                        self._jog_step_size = jog_step
+                        
+                    if debug:
+                        print(f"Initialization complete for {self.name}!")
+                except Exception as init_e:
+                    if debug:
+                        print(f"Error during attribute initialization: {init_e}")
             except Exception as e:
                 if debug:
                     print(f"Error retrieving device info: {e}")

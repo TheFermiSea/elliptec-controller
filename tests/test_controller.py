@@ -127,34 +127,59 @@ def mock_serial_port():
 @pytest.fixture
 def rotator_addr_1(mock_serial_port):
     """Provide an ElliptecRotator instance using the mock serial port at address '1'."""
-    # Initialization with a mock port object will not call get_device_info automatically.
+    # We need to set up responses for the homing and initialization process
+    # Set up device info response
+    mock_serial_port.set_response("1in", b"1IN0E1140060920231701016800023000\r\n")
+    
+    # Set up status response for initial home command
+    mock_serial_port.set_response("1ho0", b"1GS00\r\n")  # Immediate success
+    
+    # Set up position response
+    mock_serial_port.set_response("1gp", b"1PO00000000\r\n")  # Position at 0
+    
+    # Set up velocity response
+    mock_serial_port.set_response("1gv", b"1GV3C\r\n")  # 60% velocity
+    
+    # Set up jog step response
+    mock_serial_port.set_response("1gj", b"1GJ00003FFF\r\n")  # 1 degree jog step
+    
+    # Now create the rotator that will use these responses
     rot = ElliptecRotator(mock_serial_port, motor_address=1, name="Rotator-1", debug=False)
-    # Manually set pulse count and other relevant state often set by get_device_info
-    # Using value from user's device example for realistic calculations
-    rot.pulse_per_revolution = 143360
-    rot.pulses_per_deg = rot.pulse_per_revolution / 360.0
-    rot.device_info = {'type': '0E', 'pulses_per_unit_dec': '143360'} # Minimal info for tests
-    rot.position_degrees = 0.0 # Assume starts at 0 after mock init
-    rot.velocity = 60
-    rot.jog_step_degrees = 1.0
-    mock_serial_port.clear_responses() # Clear any setup noise
+    
+    # Ensure correct values have been set
+    assert rot.pulse_per_revolution == 143360  # From device info response
+    assert hasattr(rot, "position_degrees")  # Should be set during init
+    
+    mock_serial_port.clear_responses()  # Clear setup responses for test
     return rot
 
 
 @pytest.fixture
 def rotator_addr_8(mock_serial_port):
     """Provide an ElliptecRotator instance using the mock serial port at address '8'."""
+    # We need to set up responses for the homing and initialization process
+    # Set up device info response
+    mock_serial_port.set_response("8in", b"8IN0E1140060920231701016800023000\r\n")
+    
+    # Set up status response for initial home command
+    mock_serial_port.set_response("8ho0", b"8GS00\r\n")  # Immediate success
+    
+    # Set up position response
+    mock_serial_port.set_response("8gp", b"8PO00000000\r\n")  # Position at 0
+    
+    # Set up velocity response
+    mock_serial_port.set_response("8gv", b"8GV3C\r\n")  # 60% velocity
+    
+    # Set up jog step response
+    mock_serial_port.set_response("8gj", b"8GJ00003FFF\r\n")  # 1 degree jog step
+    
+    # Now create the rotator that will use these responses
     rot = ElliptecRotator(mock_serial_port, motor_address=8, name="Rotator-8", debug=False)
-    # Manually set pulse count, mirroring rotator_addr_1 for consistency in tests
-    rot.pulse_per_revolution = 143360
-    rot.pulses_per_deg = rot.pulse_per_revolution / 360.0
+    
     # Set _fixture_test attribute so that special test handling in get_status can be triggered if needed.
     rot._fixture_test = True
-    # Set attributes that are set in rotator_addr_1 fixture
-    rot.device_info = {'type': '0E', 'pulses_per_unit_dec': '143360'}
-    rot.position_degrees = 0.0
-    rot.velocity = 60
-    mock_serial_port.clear_responses()
+    
+    mock_serial_port.clear_responses()  # Clear setup responses for test
     return rot
 
 
@@ -213,9 +238,13 @@ def test_rotator_init_with_string(mock_serial_class):
     mock_serial_instance.is_open = True
     mock_serial_class.return_value = mock_serial_instance
 
-    # Create a patch that simply returns succesful device info
+    # Create necessary patches for initialization
     with patch.object(ElliptecRotator, 'get_device_info', return_value={'type': '0E', 'pulses_per_unit_dec': '143360'}):
-        rot = ElliptecRotator(port="/dev/mock", motor_address=2, name="StringInit", debug=False)
+        with patch.object(ElliptecRotator, 'home', return_value=True):
+            with patch.object(ElliptecRotator, 'update_position', return_value=0.0):
+                with patch.object(ElliptecRotator, 'get_velocity', return_value=60):
+                    with patch.object(ElliptecRotator, 'get_jog_step', return_value=1.0):
+                        rot = ElliptecRotator(port="/dev/mock", motor_address=2, name="StringInit", debug=False)
 
     mock_serial_class.assert_called_once_with(
         port="/dev/mock", baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1
@@ -224,9 +253,8 @@ def test_rotator_init_with_string(mock_serial_class):
     assert rot.serial == mock_serial_instance
     assert rot.physical_address == '2'
     assert rot.pulse_per_revolution == 143360 # Should be set by get_device_info
-    # Skip position and other state checks as they may not be set at init
-    assert rot._jog_step_size == 1.0 # Default jog step size
-    assert rot.velocity == 60 # Default velocity
+    assert rot._jog_step_size == 1.0 # Should be set by get_jog_step
+    assert rot.velocity == 60 # Should be set by get_velocity
 
 # Test Send Command
 def test_send_command_simple(rotator_addr_1, mock_serial_port):
