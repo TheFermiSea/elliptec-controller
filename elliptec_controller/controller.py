@@ -13,6 +13,7 @@ import serial
 import time
 import threading
 from typing import Dict, List, Optional, Union, Any
+import serial as pyserial  # Import with alias to avoid issues with patching
 
 
 # Motor command constants - based on ELLx protocol manual
@@ -21,7 +22,8 @@ COMMAND_STOP = "st"  # Stop the motor (_HOST_MOTIONSTOP "st")
 COMMAND_HOME = "ho"  # Move to the home position (_HOSTREQ_HOME "ho")
 COMMAND_FORWARD = "fw"  # Move the motor forward
 COMMAND_BACKWARD = "bw"  # Move the motor backward
-COMMAND_MOVE_ABS = "ma"  # Move to absolute position (_HOSTREQ_MOVEABSOLUTE "ma")
+# Move to absolute position (_HOSTREQ_MOVEABSOLUTE "ma")
+COMMAND_MOVE_ABS = "ma"
 COMMAND_MOVE_REL = "mr"  # Move by relative amount (_HOSTREQ_MOVERELATIVE "mr")
 COMMAND_GET_POS = "gp"  # Get current position (_HOST_GETPOSITION "gp")
 COMMAND_SET_VELOCITY = "sv"  # Set velocity (_HOSTSET_VELOCITY "sv")
@@ -29,7 +31,8 @@ COMMAND_GET_VELOCITY = "gv"  # Get velocity (_HOSTREQ_VELOCITY "gv")
 COMMAND_SET_HOME_OFFSET = "so"  # Set home offset (_HOSTSET_HOMEOFFSET "so")
 COMMAND_GET_HOME_OFFSET = "go"  # Get home offset (_HOSTREQ_HOMEOFFSET "go")
 COMMAND_GROUP_ADDRESS = (
-    "ga"  # Set group address for synchronized movement (_HOST_GROUPADDRESS "ga")
+    # Set group address for synchronized movement (_HOST_GROUPADDRESS "ga")
+    "ga"
 )
 COMMAND_OPTIMIZE_MOTORS = "om"  # Optimize motors (_HOST_OPTIMIZE_MOTORS "om")
 COMMAND_GET_INFO = "in"  # Get device information (_DEVGET_INFORMATION "IN")
@@ -132,7 +135,8 @@ class ElliptecRotator:
             group_address: Optional group address for synchronous movement
             debug: Whether to print debug information
         """
-        self.physical_address = str(motor_address)  # Device's actual hardware address
+        self.physical_address = str(
+            motor_address)  # Device's actual hardware address
         self.active_address = (
             self.physical_address
         )  # Address the device currently responds to
@@ -142,9 +146,13 @@ class ElliptecRotator:
             False  # True if this rotator is listening to a group_address
         )
         self.group_offset_degrees = 0.0  # Offset in degrees for group movements
-        self.velocity = 60  # Default to ~60% velocity
-        self.optimal_frequency = None
-        self._jog_step_size = 1.0  # Default jog step size in degrees
+        # Internal state variables
+        self.velocity: Optional[int] = 60  # Default velocity setting (0-64)
+        # Last known position in degrees
+        self.position_degrees: Optional[float] = None
+        # Last known jog step in degrees
+        self.jog_step_degrees: Optional[float] = 1.0
+        self.optimal_frequency = None  # Not currently implemented
         self._command_lock = threading.Lock()
         # group_address parameter from __init__ is no longer used directly here,
         # as grouping is configured by dedicated methods.
@@ -156,37 +164,70 @@ class ElliptecRotator:
         self.device_info = {}
 
         # Initialize serial port
-        # Check for mock attributes FIRST using duck typing
-        # Look for attributes common to mocks used in tests (log, write)
-        # Exclude actual serial.Serial and str types which are handled below.
-        if (not isinstance(port, (str, serial.Serial)) and
-            hasattr(port, "log") and hasattr(port, "write")):
-            # Assume it's a suitable mock object for testing
-            self.serial = port
-        elif isinstance(port, serial.Serial):  # Check real serial
-            self.serial = port
-        elif isinstance(port, str):  # Check string
-            self.serial = serial.Serial(
-                port=port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1
-            )
-
-            # Load device info and get pulse_per_revolution after connection is established
+        if isinstance(port, str):
+            # If port is a string, create and open the serial connection
             try:
-                self.get_device_info(debug=debug)
-                if debug and hasattr(self, "device_info"):
-                    print(f"Device info for {self.name}: {self.device_info}")
-                    if hasattr(self, "pulse_per_revolution"):
+                self.serial = pyserial.Serial(
+                    port=port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1
+                )
+                # Attempt to get device info immediately after opening
+                try:
+                    self.get_device_info(debug=debug)
+                    if debug and self.device_info:
+                         print(
+    f"Initial device info for {
+        self.name}: {
+            self.device_info}")
+                except Exception as e:
+                    if debug:
                         print(
-                            f"Using pulse_per_revolution: {self.pulse_per_revolution}"
-                        )
-                    if hasattr(self, "pulses_per_deg"):
-                        print(f"Using pulses_per_deg: {self.pulses_per_deg}")
-            except Exception as e:
-                if debug:
-                    print(f"Error retrieving device info: {e}")
-        # else: # Removed the fallback else as duck typing check now handles mocks
-        #    # Assume it's a mock object for testing
-        #    self.serial = port
+    f"Warning: Failed to get device info during init: {e}")
+                    # Continue even if get_device_info fails, use defaults
+            except pyserial.SerialException as e:
+                 if debug:
+                     print(f"Error: Failed to open serial port {port}: {e}")
+                 # Raise a more specific error for connection failure
+                 raise ConnectionError(
+    f"Failed to open serial port {port}") from e
+
+            # Attempt to query initial state only if serial port was
+            # successfully opened
+            if hasattr(self, 'serial') and self.serial.is_open:
+                if debug: print(f"Querying initial state for {self.name}...")
+                try:
+                    # Query position, velocity, jog step
+                    # Updates self.position_degrees
+                    self.update_position(debug=debug)
+                except Exception as e:
+                    if debug: print(f"  Warning: Failed to query initial jog step: {e}")
+                try:
+                    self.get_velocity(debug=debug)  # Updates self.velocity
+                except Exception as e:
+                    if debug: print(f"  Warning: Failed to query initial velocity: {e}")
+                try:
+                    # Updates self.jog_step_degrees
+                    self.get_jog_step(debug=debug)
+                except Exception as e:
+                    if debug: print(f"  Warning: Failed to query initial jog step: {e}")
+
+            except pyserial.SerialException as e:
+                 if debug:
+                     print(f"Error: Failed to open serial port {port}: {e}")
+                 # Raise a more specific error for connection failure
+                 raise ConnectionError(
+    f"Failed to open serial port {port}") from e
+        # elif hasattr(port, \'write\'): # Basic check for mock or pre-opened
+        # serial-like object # This logic was incorrect, simplified below
+        # Handle cases where port is not a string (assumed pre-opened or mock)
+        else:
+            # Assume it\'s a pre-opened serial.Serial object or a mock object
+            self.serial = port
+            if debug:
+                print(
+    f"Using provided port object (type: {
+        type(port)}). Device info not fetched automatically during init.")
+            # Do NOT call get_device_info here, as the state of the passed object is unknown
+            # or it's a mock which might not need/support it during init.
 
     def send_command(
         self,
@@ -221,7 +262,9 @@ class ElliptecRotator:
                     self.serial.open()
                 except serial.SerialException as e:
                     if debug:
-                        print(f"Error opening serial port for {self.name}: {e}")
+                        print(
+    f"Error opening serial port for {
+        self.name}: {e}")
                     return ""  # Cannot send command if port cannot be opened
 
             try:
@@ -230,7 +273,8 @@ class ElliptecRotator:
             except serial.SerialException as e:
                 if debug:
                     print(
-                        f"Error resetting serial port buffers for {self.name}: {e}"
+                        f"Error resetting serial port buffers for {
+    self.name}: {e}"
                     )
                 # Non-fatal, try to continue
 
@@ -252,7 +296,12 @@ class ElliptecRotator:
 
             if debug:
                 print(
-                    f"Sending to {self.name} (using addr: {address_to_send_with}): '{cmd_str.strip()}' (hex: {' '.join(f'{ord(c):02x}' for c in cmd_str)})"
+                    f"Sending to {
+    self.name} (using addr: {address_to_send_with}): '{
+        cmd_str.strip()}' (hex: {
+            ' '.join(
+                f'{
+                    ord(c):02x}' for c in cmd_str)})"
                 )
 
             try:
@@ -285,7 +334,8 @@ class ElliptecRotator:
             try:
                 while (time.time() - start_time) < effective_timeout:
                     if self.serial.in_waiting > 0:
-                        response_bytes += self.serial.read(self.serial.in_waiting)
+                        response_bytes += self.serial.read(
+                            self.serial.in_waiting)
                         # Check for CR+LF termination
                         if response_bytes.endswith(b"\r\n"):
                             break
@@ -293,7 +343,8 @@ class ElliptecRotator:
                         elif response_bytes.endswith(
                             b"\n"
                         ) or response_bytes.endswith(b"\r"):
-                            # Check again quickly if more data is coming for the other part of CR/LF
+                            # Check again quickly if more data is coming for
+                            # the other part of CR/LF
                             time.sleep(0.005)
                             if self.serial.in_waiting > 0:
                                 response_bytes += self.serial.read(
@@ -307,28 +358,44 @@ class ElliptecRotator:
                             # (though spec says CR+LF)
                             if debug:
                                 print(
-                                    f"Partial EOL detected for {self.name}, treating as end of response. Raw: {response_bytes!r}"
+                                    f"Partial EOL detected for {
+    self.name}, treating as end of response. Raw: {
+        response_bytes!r}"
                                 )
                             break
+                        # Add a small sleep even if data was read to prevent
+                        # tight loop on partial data
+                        time.sleep(0.005)
 
-                    time.sleep(0.01)  # Brief pause
-            except serial.SerialException as e:
+                    # If no data is waiting, sleep a bit longer
+                    elif self.serial.in_waiting == 0:
+                         time.sleep(0.01)  # Brief pause if nothing is waiting
+
+            except pyserial.SerialException as e:  # Use alias
                 if debug:
-                    print(f"Error reading from serial port for {self.name}: {e}")
+                    print(
+    f"Error reading from serial port for {
+        self.name}: {e}")
                 return ""  # Read failed
 
+            # Decode and strip ALL leading/trailing whitespace (including \\r,
+            # \\n)
             response_str = response_bytes.decode(
-                "ascii", errors="replace"
-            ).strip()  # Strip all whitespace including CR/LF
+                "ascii", errors="replace").strip()
 
             if debug:
                 duration_ms = (time.time() - start_time) * 1000
                 print(
-                    f"Response from {self.name} (expecting from addr: {address_to_expect_reply_from}): '{response_str}' (raw: {response_bytes!r}) (took {duration_ms:.1f}ms)"
+                    f"Response from {
+    self.name} (expecting from addr: {address_to_expect_reply_from}): '{response_str}' (raw: {
+        response_bytes!r}) (took {
+            duration_ms:.1f}ms)"
                 )
                 if not response_str:
                     print(
-                        f"WARNING: No response from {self.name} (or timed out after {effective_timeout:.2f}s)"
+                        f"WARNING: No response from {
+    self.name} (or timed out after {
+        effective_timeout:.2f}s)"
                     )
 
             # Validate response prefix
@@ -344,16 +411,17 @@ class ElliptecRotator:
             ):
                 if debug:
                     print(
-                        f"Matched response with case-insensitive address for {self.name}: '{response_str}'"
+                        f"Matched response with case-insensitive address for {
+    self.name}: '{response_str}'"
                     )
                 return response_str  # Return the original casing from the device
             else:
                 if debug and response_str:
                     print(
-                        f"WARNING: Response from {self.name} ('{response_str}') did not match expected address prefix '{address_to_expect_reply_from}'. Discarding."
+                        f"WARNING: Response from {
+    self.name} ('{response_str}') did not match expected address prefix '{address_to_expect_reply_from}'. Discarding."
                     )
             return ""
-
 
     def get_status(
         self, debug: bool = False, timeout_override: Optional[float] = None
@@ -366,32 +434,40 @@ class ElliptecRotator:
 
             Returns:
                 str: Status code (e.g., "00" for OK, "09" for moving), or empty string on error.
-        """
-        # Pass the timeout_override directly to send_command.
-        # send_command has its own default timeout logic if timeout_override is None.
-        response = self.send_command(
+            """
+            # Pass the timeout_override directly to send_command.
+            # send_command has its own default timeout logic if
+            # timeout_override is None.
+            response = self.send_command(
             COMMAND_GET_STATUS, debug=debug, timeout=timeout_override
         )
 
-        # Response from send_command is already stripped and address-checked against self.active_address
+        )
+
+        # Response from send_command is already stripped and address-checked
+        # against self.active_address
         if response:  # send_command returns an empty string on error or mismatched address
             # Command is "gs", so the response should be <active_address>GS<status_code>
             # Example: "1GS00"
-            # We need to extract the status code part, which is after <active_address>GS
+            # We need to extract the status code part, which is after
+            # <active_address>GS
             expected_prefix = f"{self.active_address}GS"
             if response.startswith(expected_prefix):
                 status_code = response[
-                    len(expected_prefix) :
+                    len(expected_prefix):
                 ].strip()  # Ensure any extra whitespace is stripped
                 if debug:
                     print(f"Status for {self.name}: {status_code}")
                 return status_code
             elif debug:
                 print(
-                    f"Unexpected GS response format for {self.name}: '{response}'. Expected prefix: '{expected_prefix}'"
+                    f"Unexpected GS response format for {
+    self.name}: '{response}'. Expected prefix: '{expected_prefix}'"
                 )
         elif debug:
-            print(f"No valid GS response or error in send_command for {self.name}")
+            print(
+    f"No valid GS response or error in send_command for {
+        self.name}")
 
         return ""  # Return empty string if no valid status code is found
 
@@ -486,7 +562,8 @@ class ElliptecRotator:
                 elif status == "09" or status == "01":
                     return self.wait_until_ready()
                 else:
-                    # For other status codes, still wait as the device might be busy
+                    # For other status codes, still wait as the device might be
+                    # busy
                     return self.wait_until_ready()
             return True
 
@@ -509,31 +586,36 @@ class ElliptecRotator:
         expected_prefix = f"{self.active_address}GV"
         if response and response.startswith(expected_prefix):
             hex_vel = response[len(expected_prefix):].strip()
-            if len(hex_vel) == 2: # Expecting 2 hex characters
+            if len(hex_vel) == 2:  # Expecting 2 hex characters
                 try:
                     velocity_val = int(hex_vel, 16)
-                    # Clamp to expected range just in case device reports outside 0-64
+                    # Clamp to expected range just in case device reports
+                    # outside 0-64
                     clamped_velocity = max(0, min(velocity_val, 64))
                     if debug:
-                        print(f"{self.name}: Retrieved velocity hex: {hex_vel}, decimal: {velocity_val}, clamped: {clamped_velocity}")
-                    # Update internal state as well? Maybe not, just report what device says.
-                    # self.velocity = clamped_velocity
+                        print(
+                            f"{self.name}: Retrieved velocity hex: {hex_vel}, decimal: {velocity_val}, clamped: {clamped_velocity}")
+                    # Update internal state
+                    self.velocity = clamped_velocity
                     return clamped_velocity
                 except ValueError:
                     if debug:
-                        print(f"{self.name}: Failed to parse velocity hex: '{hex_vel}'")
+                        print(
+                            f"{self.name}: Failed to parse velocity hex: \'{hex_vel}\'")
                     return None
             elif debug:
-                print(f"{self.name}: Unexpected velocity response format (length): '{response}'")
+                print(
+                    f"{self.name}: Unexpected velocity response format (length): '{response}'")
                 return None
         elif debug:
-            print(f"{self.name}: No valid velocity response or error in send_command. Response: '{response}'")
+            print(
+                f"{self.name}: No valid velocity response or error in send_command. Response: '{response}'")
 
         return None
 
     def set_velocity(self, velocity: int) -> bool:
         """
-        Set the velocity of the rotator.
+        Set the velocity of the rotator (0-64).
 
         According to the protocol manual (_HOSTSET_VELOCITY "sv"), this command
         requires a 5-byte structure with the command followed by a 2-byte value.
@@ -555,7 +637,8 @@ class ElliptecRotator:
             )
             velocity = 64
         elif velocity < 0:
-            print(f"Warning: Velocity value {velocity} is negative, clamping to 0.")
+            print(
+    f"Warning: Velocity value {velocity} is negative, clamping to 0.")
             velocity = 0
 
         # Convert velocity to hex
@@ -570,14 +653,16 @@ class ElliptecRotator:
         # or rely on get_velocity if needed later.
         self.velocity = self.get_velocity()
 
-        # Check response - according to manual, device responds with GS (status)
-        if response and response.startswith(f"{self.active_address}GS"):
-            return True
-
-        # If no response or unexpected response, command may have failed
-        # Consider restoring self.velocity to its previous value if strict error handling is needed
-        # For now, we assume the set command if sent, might have taken effect or will be queried.
-        return False
+        # Check response - according to manual, device responds with GS
+        # (status)
+        if response and response.startswith(
+            f"{self.active_address}GS") and "00" in response:
+             # Update internal state only if command was successful
+             self.velocity = velocity
+             return True
+        else:
+             # Command failed or no confirmation, don't update internal state
+             return False
 
     def set_jog_step(self, degrees: float) -> bool:
         """
@@ -589,9 +674,6 @@ class ElliptecRotator:
         Returns:
             bool: True if the jog step was set successfully
         """
-        # Store the jog step size
-        self._jog_step_size = degrees
-
         # Convert degrees to pulses
         if degrees == 0:
             # Set to continuous mode
@@ -605,34 +687,92 @@ class ElliptecRotator:
             )
 
             # Use device-specific pulse count if available
-            if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
-                jog_data = degrees_to_hex(target_degrees, self.pulse_per_revolution)
+            if hasattr(
+    self,
+     "pulse_per_revolution") and self.pulse_per_revolution:
+                jog_data = degrees_to_hex(
+    target_degrees, self.pulse_per_revolution)
             else:
                 jog_data = degrees_to_hex(target_degrees)
 
         # Send command
         response = self.send_command(COMMAND_SET_JOG_STEP, data=jog_data)
 
-        return response and response.startswith(f"{self.active_address}GS")
+        if response and response.startswith(
+            f"{self.active_address}GS") and "00" in response:
+            # Update internal state only if command was successful
+            # Don't store 0, keep last step size
+            self.jog_step_degrees = degrees if degrees != 0 else self.jog_step_degrees
+            return True
+        else:
+            return False
 
-    def update_position(self, debug=False) -> float:
+    def get_jog_step(self, debug: bool = False) -> Optional[float]:
         """
-        Get the current position of the rotator in degrees.
+        Get the current jog step size setting of the rotator in degrees.
+
+        Sends the 'gj' command and parses the 8-byte hexadecimal response.
+
+        Args:
+            debug (bool): Whether to print debug information.
 
         Returns:
-            float: Current position in degrees
-        float: Position in degrees
+            Optional[float]: The current jog step size in degrees, or None if retrieval fails.
         """
+        response = self.send_command(COMMAND_GET_JOG_STEP, debug=debug)
 
+        expected_prefix = f"{self.active_address}GJ"
+        if response and response.startswith(expected_prefix):
+            hex_jog = response[len(expected_prefix):].strip()
+            if len(hex_jog) == 8:  # Expecting 8 hex characters
+                try:
+                    # Use device-specific pulse count if available, else
+                    # default
+                    pulse_rev_to_use = self.pulse_per_revolution if hasattr(
+    self, 'pulse_per_revolution') and self.pulse_per_revolution else 262144
+                    jog_degrees = hex_to_degrees(hex_jog, pulse_rev_to_use)
+
+                    if debug:
+                        print(
+                            f"{self.name}: Retrieved jog step hex: {hex_jog}, degrees: {jog_degrees:.4f}")
+
+                    # Update internal state
+                    self.jog_step_degrees = jog_degrees
+                    return jog_degrees
+                except ValueError:
+                    if debug:
+                        print(
+                            f"{self.name}: Failed to parse jog step hex: '{hex_jog}'")
+                    return None
+            elif debug:
+                print(
+                    f"{self.name}: Unexpected jog step response format (length): '{response}'")
+                return None
+        elif debug:
+            print(
+                f"{self.name}: No valid jog step response or error in send_command. Response: '{response}'")
+
+        return None
+
+    def update_position(self, debug: bool = False) -> Optional[float]:
+        """
+        Get the current position of the rotator and update internal state.
+
+        Returns:
+            Optional[float]: Current position in degrees (0-360), or None on error.
+        """
         response = self.send_command(COMMAND_GET_POS, debug=debug)  # Pass debug flag
+
+
+        response = self.send_command(
+    COMMAND_GET_POS, debug=debug)  # Pass debug flag
 
         if response and response.startswith(f"{self.active_address}PO"):
             pos_hex = response[len(f"{self.active_address}PO") :].strip(" \r\n\t")
             try:
                 current_degrees = 0.0
                 pulse_rev_to_use = (
-                    self.pulse_per_revolution
-                    if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution
+
                     else 262144
                 )
                 current_degrees = hex_to_degrees(pos_hex, pulse_rev_to_use)
@@ -643,7 +783,11 @@ class ElliptecRotator:
                     ) % 360
                     if debug:
                         print(
-                            f"{self.name} (slave) physical pos: {current_degrees:.2f} deg, offset: {self.group_offset_degrees:.2f} deg, logical pos: {logical_position:.2f} deg"
+                            f"{
+    self.name} (slave) physical pos: {
+        current_degrees:.2f} deg, offset: {
+            self.group_offset_degrees:.2f} deg, logical pos: {
+                logical_position:.2f} deg"
                         )
                     return logical_position
                 else:
@@ -655,11 +799,14 @@ class ElliptecRotator:
             except ValueError:
                 if debug:
                     print(
-                        f"Warning: Could not convert position response '{pos_hex}' to degrees for {self.name}."
+                        f"Warning: Could not convert position response '{pos_hex}' to degrees for {
+    self.name}."
                     )
                     return 0.0
                 elif debug:
-                    print(f"No valid position response for {self.name}. Response: '{response}'")
+                    print(
+    f"No valid position response for {
+        self.name}. Response: '{response}'")
                     return 0.0
 
     def move_absolute(
@@ -668,12 +815,12 @@ class ElliptecRotator:
         """
         Move the rotator to an absolute position.
 
-        According to the protocol manual (_HOSTREQ_MOVEABSOLUTE "ma"), this command
-        requires an 11-byte structure with the command followed by an 8-byte position.
-        The device will reply with either GS (status) or PO (position) response.
+        According to the protocol manual(_HOSTREQ_MOVEABSOLUTE "ma"), this command
+        requires an 11 - byte structure with the command followed by an 8 - byte position.
+        The device will reply with either GS(status) or PO(position) response.
 
         Args:
-            degrees: Target position in degrees (0-360)
+            degrees: Target position in degrees(0 - 360)
             wait: Whether to wait for movement to complete
             debug: Whether to print debug information
 
@@ -685,7 +832,8 @@ class ElliptecRotator:
 
         # Apply offset if this rotator is part of a group and has an offset
         # The 'degrees' parameter is the logical target for the group.
-        # This specific rotator needs to move to 'logical_target + its_own_offset'.
+        # This specific rotator needs to move to 'logical_target +
+        # its_own_offset'.
         if (
             self.is_slave_in_group
         ):  # For a slave, self.group_offset_degrees is its specific offset
@@ -694,7 +842,9 @@ class ElliptecRotator:
             ) % 360
             if debug:
                 print(
-                    f"Slave {self.name} in group: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
+                    f"Slave {
+    self.name} in group: logical_target={target_degrees_logical}, offset={
+        self.group_offset_degrees}, physical_target={physical_target_degrees}"
                 )
         elif (
             self.group_offset_degrees != 0.0
@@ -704,21 +854,29 @@ class ElliptecRotator:
             ) % 360
             if debug:
                 print(
-                    f"Master/Standalone {self.name} with offset: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
+                    f"Master/Standalone {
+    self.name} with offset: logical_target={target_degrees_logical}, offset={
+        self.group_offset_degrees}, physical_target={physical_target_degrees}"
                 )
         else:  # Standalone rotator or master with no offset, or slave with no offset.
             physical_target_degrees = target_degrees_logical
             if debug:
                 print(
-                    f"Standalone {self.name}: logical_target={target_degrees_logical}, physical_target={physical_target_degrees}"
+                    f"Standalone {
+    self.name}: logical_target={target_degrees_logical}, physical_target={physical_target_degrees}"
                 )
 
-        # Convert to hex position using device-specific pulse count if available
+        # Convert to hex position using device-specific pulse count if
+        # available
         if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
-            hex_pos = degrees_to_hex(physical_target_degrees, self.pulse_per_revolution)
+            hex_pos = degrees_to_hex(
+    physical_target_degrees,
+     self.pulse_per_revolution)
             if debug:
                 print(
-                    f"Using device-specific pulse count: {self.pulse_per_revolution} for {self.name}"
+                    f"Using device-specific pulse count: {
+    self.pulse_per_revolution} for {
+        self.name}"
                 )
         else:
             hex_pos = degrees_to_hex(physical_target_degrees)
@@ -727,13 +885,19 @@ class ElliptecRotator:
 
         if debug:
             print(
-                f"{self.name} moving to physical target {physical_target_degrees:.2f} deg (hex: {hex_pos})"
+                f"{
+    self.name} moving to physical target {
+        physical_target_degrees:.2f} deg (hex: {hex_pos})"
             )
 
         # Send the command
-        response = self.send_command(COMMAND_MOVE_ABS, data=hex_pos, debug=debug)
+        response = self.send_command(
+    COMMAND_MOVE_ABS, data=hex_pos, debug=debug)
 
-        # Set moving state regardless of response - command was sent
+        # Set moving state initially, will be cleared by wait_until_ready or next status check
+        # Only set is_moving if command was likely sent (response is not None potentially?)
+        # For now, set optimistically, assuming send_command doesn't raise
+        # error
         self.is_moving = True
 
         # According to manual, device responds with either GS (status) or PO (position)
@@ -746,7 +910,8 @@ class ElliptecRotator:
                 return self.wait_until_ready()
             return True
         else:
-            # No response received, but command might have been accepted by the device.
+            # No response received, but command might have been accepted by the
+            # device.
             if wait:
                 if debug:
                     print(
@@ -754,14 +919,23 @@ class ElliptecRotator:
                     )
                 # Brief pause to allow movement to start if the device is slow to process
                 # but did receive the command.
-                time.sleep(0.2)  # Increased slightly
-                return self.wait_until_ready()
-            else:
+                time.sleep(0.2) # Increased slightly
+                success = self.wait_until_ready()
+                if success:
+                     self.position_degrees = target_degrees_logical
+                     if debug: print(f"{self.name}: Move successful (no initial response), position updated to {self.position_degrees:.2f} deg (logical)")
+                elif debug:
+                     print(
+                         f"{self.name}: Move attempt failed (no initial response and timed out waiting).")
+                return success
+            else: # Not waiting
                 # If not waiting, assume the command was sent and might be processing.
                 # The caller opted not to wait for confirmation of completion.
+                # Cannot update position reliably without waiting.
                 if debug:
                     print(
-                        f"{self.name}: No immediate response for move_absolute, command sent (wait=False). Assuming success."
+                        f"{
+    self.name}: No immediate response for move_absolute, command sent (wait=False). Assuming success."
                     )
                 return True
 
@@ -772,7 +946,7 @@ class ElliptecRotator:
         Start or stop continuous movement of the rotator.
 
         Args:
-            direction: Direction of movement ("fw" [forward] or "bw" [backward])
+            direction: Direction of movement("fw" [forward] or "bw" [backward])
             start: True to start movement, False to stop
 
         Returns:
@@ -803,15 +977,19 @@ class ElliptecRotator:
             # Stop the movement
             return self.stop()
 
-    def configure_as_group_slave(self, master_address_to_listen_to: str, slave_offset: float = 0.0, debug: bool = False) -> bool:
+    def configure_as_group_slave(
+    self,
+    master_address_to_listen_to: str,
+    slave_offset: float = 0.0,
+     debug: bool = False) -> bool:
         """
-        Instruct this rotator (slave) to listen to a master_address.
+        Instruct this rotator(slave) to listen to a master_address.
         Used for synchronized group movements.
 
         Args:
-            master_address_to_listen_to (str): The address this rotator should listen to (0-F).
-            slave_offset (float): Angular offset in degrees for this slave rotator.
-            debug (bool): Whether to print debug information.
+            master_address_to_listen_to(str): The address this rotator should listen to(0 - F).
+            slave_offset(float): Angular offset in degrees for this slave rotator.
+            debug(bool): Whether to print debug information.
 
         Returns:
             bool: True if configuration was successful.
@@ -819,37 +997,52 @@ class ElliptecRotator:
         try:
             int(master_address_to_listen_to, 16)
             if len(master_address_to_listen_to) != 1:
-                raise ValueError("Master address must be a single hex character.")
+                raise ValueError(
+                    "Master address must be a single hex character.")
         except ValueError:
             if debug:
-                print(f"Invalid master_address_to_listen_to: '{master_address_to_listen_to}'. Must be 0-F.")
+                print(
+    f"Invalid master_address_to_listen_to: '{master_address_to_listen_to}'. Must be 0-F.")
             return False
 
         if debug:
-            print(f"Configuring {self.name} (phys_addr: {self.physical_address}) to listen to master_addr: {master_address_to_listen_to} with offset: {slave_offset} deg.")
+            print(
+    f"Configuring {
+        self.name} (phys_addr: {
+            self.physical_address}) to listen to master_addr: {master_address_to_listen_to} with offset: {slave_offset} deg.")
 
         # Command: <physical_address_of_slave>ga<master_address_to_listen_to>
         # Reply expected from: <master_address_to_listen_to>GS<status>
         response = self.send_command(
             command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
             data=master_address_to_listen_to,
-            send_addr_override=self.physical_address, # Send command using its physical address
-            expect_reply_from_addr=master_address_to_listen_to, # Reply comes from the new address
+            # Send command using its physical address
+            send_addr_override=self.physical_address,
+            # Reply comes from the new address
+            expect_reply_from_addr=master_address_to_listen_to,
             debug=debug,
             timeout_multiplier=1.5 # Give 'ga' a bit more time for response
         )
 
-        if response and response.startswith(f"{master_address_to_listen_to}GS") and "00" in response: # Check for "00" status
+        if response and response.startswith(
+    f"{master_address_to_listen_to}GS") and "00" in response: # Check for "00" status
             self.active_address = master_address_to_listen_to
             self.group_offset_degrees = slave_offset
             self.is_slave_in_group = True
             if debug:
-                print(f"{self.name} successfully configured as slave. Active_addr: {self.active_address}, Offset: {self.group_offset_degrees}")
+                print(
+    f"{
+        self.name} successfully configured as slave. Active_addr: {
+            self.active_address}, Offset: {
+                self.group_offset_degrees}")
             return True
         else:
             if debug:
-                print(f"Failed to configure {self.name} as slave. Response: {response}")
-            # Attempt to revert to physical address if partial failure, though device might be in unknown state
+                print(
+    f"Failed to configure {
+        self.name} as slave. Response: {response}")
+            # Attempt to revert to physical address if partial failure, though
+            # device might be in unknown state
             self.active_address = self.physical_address
             self.is_slave_in_group = False
             self.group_offset_degrees = 0.0
@@ -860,45 +1053,56 @@ class ElliptecRotator:
         Revert this rotator from slave mode back to its physical address.
 
         Args:
-            debug (bool): Whether to print debug information.
+            debug(bool): Whether to print debug information.
 
         Returns:
             bool: True if reversion was successful.
         """
         if not self.is_slave_in_group:
             if debug:
-                print(f"{self.name} is not in slave group mode. No reversion needed.")
+                print(
+                    f"{self.name} is not in slave group mode. No reversion needed.")
             self.active_address = self.physical_address # Ensure consistency
             self.group_offset_degrees = 0.0
             return True
 
         current_listening_address = self.active_address
         if debug:
-            print(f"Reverting {self.name} from listening to {current_listening_address} back to physical_addr: {self.physical_address}.")
+            print(
+    f"Reverting {
+        self.name} from listening to {current_listening_address} back to physical_addr: {
+            self.physical_address}.")
 
         # Command: <current_listening_address>ga<physical_address_of_this_rotator>
         # Reply expected from: <physical_address_of_this_rotator>GS<status>
         response = self.send_command(
             command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
             data=self.physical_address,
-            send_addr_override=current_listening_address, # Command is sent to the address it's currently listening on
-            expect_reply_from_addr=self.physical_address, # Reply comes from its physical address
+            send_addr_override=current_listening_address,
+     # Command is sent to the address it's currently listening on
+            # Reply comes from its physical address
+            expect_reply_from_addr=self.physical_address,
             debug=debug,
             timeout_multiplier=1.5 # Give 'ga' a bit more time for response
         )
 
-        # Always reset internal state regardless of response to avoid being stuck
+        # Always reset internal state regardless of response to avoid being
+        # stuck
         self.active_address = self.physical_address
         self.is_slave_in_group = False
         self.group_offset_degrees = 0.0
 
-        if response and response.startswith(f"{self.physical_address}GS") and "00" in response: # Check for "00" status
+        if response and response.startswith(
+            f"{self.physical_address}GS") and "00" in response: # Check for "00" status
             if debug:
-                print(f"{self.name} successfully reverted to physical address {self.physical_address}.")
+                print(
+                    f"{self.name} successfully reverted to physical address {self.physical_address}.")
             return True
         else:
             if debug:
-                print(f"Failed to revert {self.name} to physical address. Response: {response}. Internal state reset.")
+                print(
+    f"Failed to revert {
+        self.name} to physical address. Response: {response}. Internal state reset.")
             return False
 
     def optimize_motors(self, wait: bool = True) -> bool:
