@@ -688,6 +688,51 @@ class ElliptecRotator:
             else:
                 return False
         return False # Should be unreachable if lock is held, but ensure bool path
+    
+    def get_jog_step(self, debug: bool = False) -> Optional[float]:
+        """
+        Get the current jog step size in degrees.
+    
+        Args:
+            debug: Whether to print debug information
+        
+        Returns:
+            Optional[float]: Current jog step size in degrees, or None on error
+        """
+        with self._command_lock:
+            response = self.send_command(COMMAND_GET_JOG_STEP, debug=debug)
+        
+            expected_prefix = f"{self.active_address}GJ"
+            if response and response.startswith(expected_prefix):
+                jog_hex = response[len(expected_prefix):].strip()
+            
+                # Use device-specific pulse count if available
+                pulse_rev_to_use = (
+                    self.pulse_per_revolution
+                    if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution
+                    else 262144
+                )
+            
+                try:
+                    jog_degrees = hex_to_degrees(jog_hex, pulse_rev_to_use)
+                
+                    # Update internal state
+                    if hasattr(self, "jog_step_degrees"):
+                        self.jog_step_degrees = jog_degrees
+                    self._jog_step_size = jog_degrees
+                
+                    if debug:
+                        print(f"Current jog step: {jog_degrees:.2f} deg")
+                
+                    return jog_degrees
+                except ValueError:
+                    if debug:
+                        print(f"Error parsing jog step value: {jog_hex}")
+                    return None
+            else:
+                if debug:
+                    print(f"Invalid or no response for get_jog_step: {response}")
+                return None
 
     def update_position(self, debug: bool = False) -> Optional[float]:
         """

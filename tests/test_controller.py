@@ -242,9 +242,9 @@ def test_rotator_init_with_string(mock_get_jog, mock_get_vel, mock_update_pos, m
 # Test Send Command
 def test_send_command_simple(rotator_addr_1, mock_serial_port):
     """Test sending a command without data."""
-    mock_serial_port.set_response(cmd_str_max, b"1GS00\\r\\n")
+    mock_serial_port.set_response("1gs", b"1GS00\r\n")
     response = rotator_addr_1.send_command("gs")
-    assert mock_serial_port.log[-1] == b"1gs\r"
+    assert mock_serial_port.log[-1] == b"1gs\\r"
     assert response == "1GS00"
 
 def test_send_command_with_data(rotator_addr_1, mock_serial_port):
@@ -252,7 +252,7 @@ def test_send_command_with_data(rotator_addr_1, mock_serial_port):
     hex_pos = "00008C00" # 90 deg with custom pulse
     mock_serial_port.set_response(f"1ma{hex_pos}", b"1PO00008C00\r\n")
     response = rotator_addr_1.send_command("ma", data=hex_pos)
-    assert mock_serial_port.log[-1] == f"{cmd_str_max}\\r".encode()
+    assert mock_serial_port.log[-1] == f"1ma{hex_pos}\\r".encode()
     assert response == "1PO00008C00"
 
 def test_send_command_wrong_address_response(rotator_addr_1, mock_serial_port):
@@ -273,29 +273,29 @@ def test_send_command_timeout(rotator_addr_1, mock_serial_port):
 def test_get_status(rotator_addr_1, mock_serial_port):
     """Test getting status."""
     # Test ready status (00)
-    mock_serial_port.set_response("1gs", b"1GS00\\r\\n")
+    mock_serial_port.set_response("1gs", b"1GS00\r\n")
     status = rotator_addr_1.get_status()
     assert mock_serial_port.log[-1] == b"1gs\\r"
     assert status == "00" # Expect stripped response
 
     # Test moving status (09)
-    mock_serial_port.set_response("1gs", b"1GS09\\r\\n") # Moving
+    mock_serial_port.set_response("1gs", b"1GS09\r\n") # Moving
     status = rotator_addr_1.get_status()
     assert status == "09" # Expect stripped response
 
 def test_is_ready(rotator_addr_1, mock_serial_port):
     """Test checking if rotator is ready."""
-    mock_serial_port.set_response("1gs", b"1GS00\\r\\n") # OK
+    mock_serial_port.set_response("1gs", b"1GS00\r\n") # OK
     assert rotator_addr_1.is_ready() is True
     assert mock_serial_port.log[-1] == b"1gs\\r" # Command format check
 
-    mock_serial_port.set_response("1gs", b"1GS09\\r\\n") # Moving
+    mock_serial_port.set_response("1gs", b"1GS09\r\n") # Moving
     assert rotator_addr_1.is_ready() is False
 
-    mock_serial_port.set_response("1gs", b"1GS01\\r\\n") # Homing
+    mock_serial_port.set_response("1gs", b"1GS01\r\n") # Homing
     assert rotator_addr_1.is_ready() is False
 
-    mock_serial_port.set_response("1gs", b"1GS0A\\r\\n") # Error
+    mock_serial_port.set_response("1gs", b"1GS0A\r\n") # Error
     assert rotator_addr_1.is_ready() is False
 
     # Test timeout/no response case for get_status
@@ -432,7 +432,7 @@ def test_set_jog_step(rotator_addr_8, mock_serial_port):
     hex_jog = degrees_to_hex(jog_deg, rotator_addr_8.pulse_per_revolution)
     cmd_str = f"8sj{hex_jog}"
     # The mock response should reflect the address used in the command key
-    mock_serial_port.set_response(cmd_str, f"8GS00\\r\\n".encode())
+    mock_serial_port.set_response(cmd_str, f"8GS00\r\n".encode())
     result = rotator_addr_8.set_jog_step(jog_deg)
     assert mock_serial_port.log[-1] == f"{cmd_str}\\r".encode()
     assert result is True
@@ -440,7 +440,7 @@ def test_set_jog_step(rotator_addr_8, mock_serial_port):
 
     # Test setting continuous (0 degrees)
     cmd_str_zero = "8sj00000000"
-    mock_serial_port.set_response(cmd_str_zero, f"8GS00\\r\\n".encode())
+    mock_serial_port.set_response(cmd_str_zero, f"8GS00\r\n".encode())
     result = rotator_addr_8.set_jog_step(0)
     assert mock_serial_port.log[-1] == f"{cmd_str_zero}\\r".encode()
     assert result is True
@@ -450,7 +450,7 @@ def test_set_jog_step(rotator_addr_8, mock_serial_port):
 def test_get_velocity(rotator_addr_1, mock_serial_port):
     """Test getting the velocity."""
     hex_vel = "28" # 40 decimal
-    mock_serial_port.set_response("1gv", f"1GV{hex_vel}\\r\\n".encode())
+    mock_serial_port.set_response("1gv", f"1GV{hex_vel}\r\n".encode())
     velocity = rotator_addr_1.get_velocity()
     assert mock_serial_port.log[-1] == b"1gv\\r"
     assert velocity == 40
@@ -460,7 +460,7 @@ def test_get_jog_step(rotator_addr_1, mock_serial_port):
     """Test getting the jog step size."""
     jog_deg = 10.0
     hex_jog = degrees_to_hex(jog_deg, rotator_addr_1.pulse_per_revolution)
-    mock_serial_port.set_response("1gj", f"1GJ{hex_jog}\\r\\n".encode())
+    mock_serial_port.set_response("1gj", f"1GJ{hex_jog}\r\n".encode())
     jog_step = rotator_addr_1.get_jog_step()
     assert mock_serial_port.log[-1] == b"1gj\\r"
     assert jog_step == pytest.approx(jog_deg, abs=1e-3)
@@ -473,7 +473,7 @@ def test_get_device_info(rotator_addr_8, mock_serial_port):
     # Example response based on user's device
     # Type=0E, SN=11400609, Year=2023, FW=17(hex)=23(dec), Thread=0(metric), HW=1, Range=0168(hex)=360(dec), Pulse=00023000(hex)=143360(dec)
     info_str = "0E1140060920231701016800023000"
-    mock_serial_port.set_response("8in", f"8IN{info_str}\\r\\n".encode())
+    mock_serial_port.set_response("8in", f"8IN{info_str}\r\n".encode())
 
     info = rotator_addr_8.get_device_info(debug=True)
 
