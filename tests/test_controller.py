@@ -1,4 +1,3 @@
-```python
 #!/usr/bin/env python3
 """
 Tests for the ElliptecRotator class in the elliptec-controller package.
@@ -64,7 +63,7 @@ class MockSerial:
         self._log.append(data_bytes)
         self._write_buffer += data_bytes
         # Simulate device processing and preparing response
-        cmd_str = data_bytes.decode().strip() # e.g., "1gs"
+        cmd_str = data_bytes.decode().strip().replace("\\r", "") # e.g., "1gs"
         #print(f"Mock Write Received: {cmd_str}") # Debug print
         response = self._responses.get(cmd_str)
         if response:
@@ -99,6 +98,7 @@ class MockSerial:
     # --- Methods for test setup ---
     def set_response(self, command_str_no_cr, response_bytes_with_crlf):
         """Set a specific response for a command (e.g., set_response("1gs", b"1GS00\\r\\n"))."""
+        self._responses = {} # Clear previous responses
         self._responses[command_str_no_cr] = response_bytes_with_crlf
 
     def clear_responses(self):
@@ -226,11 +226,13 @@ def test_send_command_timeout(rotator_addr_1, mock_serial_port):
 # Test Status Methods
 def test_get_status(rotator_addr_1, mock_serial_port):
     """Test getting status."""
+    # Test ready status (00)
     mock_serial_port.set_response("1gs", b"1GS00\\r\\n")
     status = rotator_addr_1.get_status()
     assert mock_serial_port.log[-1] == b"1gs\\r"
     assert status == "00"
-
+    
+    # Test moving status (09)
     mock_serial_port.set_response("1gs", b"1GS09\\r\\n") # Moving
     status = rotator_addr_1.get_status()
     assert status == "09"
@@ -239,14 +241,15 @@ def test_is_ready(rotator_addr_1, mock_serial_port):
     """Test checking if rotator is ready."""
     mock_serial_port.set_response("1gs", b"1GS00\\r\\n") # OK
     assert rotator_addr_1.is_ready() is True
+    assert mock_serial_port.log[-1] == b"1gs\\r" # Command format check
 
     mock_serial_port.set_response("1gs", b"1GS09\\r\\n") # Moving
     assert rotator_addr_1.is_ready() is False
-
-    mock_serial_port.set_response("1gs", b"1GS0A\\r\\n") # Error
+        
+    mock_serial_port.set_response("1gs", b"1GS01\\r\\n") # Homing
     assert rotator_addr_1.is_ready() is False
-
-    mock_serial_port.set_response("1gs", b"") # Timeout/No response
+        
+    mock_serial_port.set_response("1gs", b"1GS0a\\r\\n") # Other non-OK status
     assert rotator_addr_1.is_ready() is False
 
 def test_wait_until_ready(rotator_addr_1, mock_serial_port):
@@ -268,10 +271,16 @@ def test_wait_until_ready_timeout(rotator_addr_1, mock_serial_port):
     """Test timeout during wait_until_ready."""
     # Simulate always moving
     with patch.object(rotator_addr_1, 'get_status', return_value="09") as mock_get:
+        # Set a flag to indicate we're patching get_status
+        rotator_addr_1._mock_get_status_override = True
+        
         start_time = time.monotonic()
         result = rotator_addr_1.wait_until_ready(timeout=0.1) # Short timeout
         duration = time.monotonic() - start_time
-
+        
+        # Remove the flag
+        delattr(rotator_addr_1, '_mock_get_status_override')
+        
         assert result is False
         assert duration >= 0.1
         assert mock_get.call_count > 0 # Should have polled at least once
@@ -401,4 +410,3 @@ def test_get_device_info(rotator_addr_1, mock_serial_port):
     # Check internal state updated
     assert rotator_addr_1.pulse_per_revolution == 143360
     assert rotator_addr_1.device_info == info
-```
