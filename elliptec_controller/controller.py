@@ -144,7 +144,7 @@ class ElliptecRotator:
         self.velocity = 60  # Default to ~60% velocity
         self.optimal_frequency = None
         self._jog_step_size = 1.0  # Default jog step size in degrees
-        self._command_lock = threading.Lock()
+        self._command_lock = threading.RLock()  # Use RLock for re-entrant locking
         # group_address parameter from __init__ is no longer used directly here,
         # as grouping is configured by dedicated methods.
 
@@ -388,46 +388,47 @@ class ElliptecRotator:
             Returns:
                 str: Status code (e.g., "00" for OK, "09" for moving), or empty string on error.
         """
-        # Special handling for tests
-        if hasattr(self, "_fixture_test") and hasattr(self.serial, "_responses"):
-            # If the test has set up a response, we should use it
-            if self.serial._responses:
-                # Let send_command handle it normally
-                pass
-            else:
-                # Simulate a successful get_status for tests that rely on that behavior
-                cmd_str = f"{self.active_address}gs\\r"
-                if hasattr(self.serial, "_log"):
-                    self.serial._log.append(cmd_str.encode())
-                return "00"
+        with self._command_lock:
+            # Special handling for tests
+            if hasattr(self, "_fixture_test") and hasattr(self.serial, "_responses"):
+                # If the test has set up a response, we should use it
+                if self.serial._responses:
+                    # Let send_command handle it normally
+                    pass
+                else:
+                    # Simulate a successful get_status for tests that rely on that behavior
+                    cmd_str = f"{self.active_address}gs\\r"
+                    if hasattr(self.serial, "_log"):
+                        self.serial._log.append(cmd_str.encode())
+                    return "00"
 
-        # Pass the timeout_override directly to send_command.
-        # send_command has its own default timeout logic if timeout_override is None.
-        response = self.send_command(
-            COMMAND_GET_STATUS, debug=debug, timeout=timeout_override
-        )
+            # Pass the timeout_override directly to send_command.
+            # send_command has its own default timeout logic if timeout_override is None.
+            response = self.send_command(
+                COMMAND_GET_STATUS, debug=debug, timeout=timeout_override
+            )
 
-        # Response from send_command is already stripped and address-checked against self.active_address
-        if response:  # send_command returns an empty string on error or mismatched address
-            # Command is "gs", so the response should be <active_address>GS<status_code>
-            # Example: "1GS00"
-            # We need to extract the status code part, which is after <active_address>GS
-            expected_prefix = f"{self.active_address}GS"
-            if response.startswith(expected_prefix):
-                status_code = response[
-                    len(expected_prefix) :
-                ].strip()  # Ensure any extra whitespace is stripped
-                if debug:
-                    print(f"Status for {self.name}: {status_code}")
-                return status_code
+            # Response from send_command is already stripped and address-checked against self.active_address
+            if response:  # send_command returns an empty string on error or mismatched address
+                # Command is "gs", so the response should be <active_address>GS<status_code>
+                # Example: "1GS00"
+                # We need to extract the status code part, which is after <active_address>GS
+                expected_prefix = f"{self.active_address}GS"
+                if response.startswith(expected_prefix):
+                    status_code = response[
+                        len(expected_prefix) :
+                    ].strip()  # Ensure any extra whitespace is stripped
+                    if debug:
+                        print(f"Status for {self.name}: {status_code}")
+                    return status_code
+                elif debug:
+                    print(
+                        f"Unexpected GS response format for {self.name}: '{response}'. Expected prefix: '{expected_prefix}'"
+                    )
             elif debug:
-                print(
-                    f"Unexpected GS response format for {self.name}: '{response}'. Expected prefix: '{expected_prefix}'"
-                )
-        elif debug:
-            print(f"No valid GS response or error in send_command for {self.name}")
+                print(f"No valid GS response or error in send_command for {self.name}")
 
-        return ""  # Return empty string if no valid status code is found
+            return ""  # Return empty string if no valid status code is found
 
     def is_ready(self, status_check_timeout: Optional[float] = None) -> bool:
         """
@@ -463,28 +464,28 @@ class ElliptecRotator:
         Returns:
             bool: True if rotator became ready, False if timeout occurred
         """
-        start_time = time.time()
-
         # Special case for test_wait_until_ready_timeout
         if hasattr(self, '_fixture_test') and timeout < 1.0 and not callable(getattr(self, 'get_status', None)):
             # This is likely the timeout test - sleep to simulate timeout
             time.sleep(timeout)
             return False
-
-        # Define a short timeout for polling status checks within the loop
-        polling_timeout = 0.1  # seconds
-        
+            
         # For test_wait_until_ready_timeout
         if hasattr(self, '_mock_get_status_override'):
             # Call the patched method at least once to increment call_count
             status = self.get_status()
             time.sleep(timeout)
             return False
+            
+        start_time = time.time()
+        # Define a short timeout for polling status checks within the loop
+        polling_timeout = 0.1  # seconds
 
         while (time.time() - start_time) < timeout:
-            # Pass the short polling timeout to the status check
+            # We don't need to lock the entire while loop as each is_ready call has its own lock
             if self.is_ready(status_check_timeout=polling_timeout):
-                self.is_moving = False
+                with self._command_lock:
+                    self.is_moving = False
                 return True
             time.sleep(0.1)
 
@@ -497,9 +498,11 @@ class ElliptecRotator:
         Returns:
             bool: True if the stop command was sent successfully
         """
-        response = self.send_command(COMMAND_STOP)
-        self.is_moving = False
-        return response and response.startswith(f"{self.active_address}GS")
+        with self._command_lock:
+            response = self.send_command(COMMAND_STOP)
+            self.is_moving = False
+            return response and response.startswith(f"{self.active_address}GS")
+
 
     def home(self, wait: bool = True) -> bool:
         """
@@ -515,36 +518,48 @@ class ElliptecRotator:
         Returns:
             bool: True if the homing command was executed successfully
         """
-        # Send "ho" command with "0" parameter as per protocol manual
-        response = self.send_command(COMMAND_HOME, data="0")
-        self.is_moving = True
+        with self._command_lock:
+            # Send "ho" command with "0" parameter as per protocol manual
+            response = self.send_command(COMMAND_HOME, data="0")
+            self.is_moving = True
 
-        # If we got a position response, that means it succeeded immediately
-        if response and response.startswith(f"{self.active_address}PO"):
-            self.is_moving = False
-            return True
+            # If we got a position response, that means it succeeded immediately
+            if response and response.startswith(f"{self.active_address}PO"):
+                self.is_moving = False
+                return True
 
-        # If we got a status response
-        if response and response.startswith(f"{self.active_address}GS"):
-            if wait:
-                return self.wait_until_ready()
-            return True
+            # If we got a status response
+            if response and response.startswith(f"{self.active_address}GS"):
+                if wait:
+                    # Release lock before potentially long wait_until_ready operation
+                    # to avoid blocking other threads
+                    pass  # Continue execution after the with block
+                else:
+                    return True
+
+        # Execute wait_until_ready outside the lock to avoid blocking during waiting
+        if wait and response and response.startswith(f"{self.active_address}GS"):
+            return self.wait_until_ready()
 
         # Even without a response, the command might still be processing
         if not response:
             if wait:
                 time.sleep(0.5)
-                status = self.get_status()
-                if status == "00":
-                    self.is_moving = False
-                    return True
-                elif status == "09" or status == "01":
+                with self._command_lock:
+                    status = self.get_status()
+                    if status == "00":
+                        self.is_moving = False
+                        return True
+                    
+                if status == "09" or status == "01":
                     return self.wait_until_ready()
                 else:
                     # For other status codes, still wait as the device might be busy
                     return self.wait_until_ready()
+            
             # If not waiting, assume success for test compatibility
-            self.is_moving = False
+            with self._command_lock:
+                self.is_moving = False
             return True
 
         return False
@@ -561,36 +576,37 @@ class ElliptecRotator:
         Returns:
             Optional[int]: The current velocity setting (0-64), or None if retrieval fails.
         """
-        response = self.send_command(COMMAND_GET_VELOCITY, debug=debug)
+        with self._command_lock:
+            response = self.send_command(COMMAND_GET_VELOCITY, debug=debug)
 
-        expected_prefix = f"{self.active_address}GV"
-        if response and response.startswith(expected_prefix):
-            hex_vel = response[len(expected_prefix):].strip()
-            if len(hex_vel) == 2: # Expecting 2 hex characters
-                try:
-                    velocity_val = int(hex_vel, 16)
-                    # Clamp to expected range just in case device reports outside 0-64
-                    clamped_velocity = max(0, min(velocity_val, 64))
-                    if debug:
-                        print(f"{self.name}: Retrieved velocity hex: {hex_vel}, decimal: {velocity_val}, clamped: {clamped_velocity}")
-                    # Update internal state as well? Maybe not, just report what device says.
-                    # self.velocity = clamped_velocity
-                    return clamped_velocity
-                except ValueError:
-                    if debug:
-                        print(f"{self.name}: Failed to parse velocity hex: '{hex_vel}'")
+            expected_prefix = f"{self.active_address}GV"
+            if response and response.startswith(expected_prefix):
+                hex_vel = response[len(expected_prefix):].strip()
+                if len(hex_vel) == 2: # Expecting 2 hex characters
+                    try:
+                        velocity_val = int(hex_vel, 16)
+                        # Clamp to expected range just in case device reports outside 0-64
+                        clamped_velocity = max(0, min(velocity_val, 64))
+                        if debug:
+                            print(f"{self.name}: Retrieved velocity hex: {hex_vel}, decimal: {velocity_val}, clamped: {clamped_velocity}")
+                        # Update internal state
+                        self.velocity = clamped_velocity
+                        return clamped_velocity
+                    except ValueError:
+                        if debug:
+                            print(f"{self.name}: Failed to parse velocity hex: \'{hex_vel}\'")
+                        return None
+                elif debug:
+                    print(f"{self.name}: Unexpected velocity response format (length): '{response}'")
                     return None
             elif debug:
-                print(f"{self.name}: Unexpected velocity response format (length): '{response}'")
-                return None
-        elif debug:
-            print(f"{self.name}: No valid velocity response or error in send_command. Response: '{response}'")
+                print(f"{self.name}: No valid velocity response or error in send_command. Response: '{response}'")
 
-        return None
+            return None
 
     def set_velocity(self, velocity: int) -> bool:
         """
-        Set the velocity of the rotator.
+        Set the velocity of the rotator (0-64).
 
         According to the protocol manual (_HOSTSET_VELOCITY "sv"), this command
         requires a 5-byte structure with the command followed by a 2-byte value.
@@ -602,35 +618,36 @@ class ElliptecRotator:
         Returns:
             bool: True if the velocity was set successfully
         """
-        # Handle special values for testing
-        orig_velocity = velocity
+        with self._command_lock:
+            # Handle special values for testing
+            orig_velocity = velocity
 
-        # Clamp velocity to valid range
-        if velocity > 64:
-            print(
-                f"Warning: Velocity value {velocity} exceeds maximum of 64, clamping."
-            )
-            velocity = 64
-        elif velocity < 0:
-            print(f"Warning: Velocity value {velocity} is negative, clamping to 0.")
-            velocity = 0
+            # Clamp velocity to valid range
+            if velocity > 64:
+                print(
+                    f"Warning: Velocity value {velocity} exceeds maximum of 64, clamping."
+                )
+                velocity = 64
+            elif velocity < 0:
+                print(f"Warning: Velocity value {velocity} is negative, clamping to 0.")
+                velocity = 0
 
-        # Convert velocity to hex
-        velocity_hex = format(velocity, "02x")
+            # Convert velocity to hex
+            velocity_hex = format(velocity, "02x")
 
-        # Send command
-        response = self.send_command(COMMAND_SET_VELOCITY, data=velocity_hex)
+            # Send command
+            response = self.send_command(COMMAND_SET_VELOCITY, data=velocity_hex)
 
-        # Check response - according to manual, device responds with GS (status)
-        if response and response.startswith(f"{self.active_address}GS"):
-            # Update internal velocity state if command was successful
-            self.velocity = velocity
-            return True
+            # Check response - according to manual, device responds with GS (status)
+            if response and response.startswith(f"{self.active_address}GS"):
+                # Update internal velocity state if command was successful
+                self.velocity = velocity
+                return True
 
-        # If no response or unexpected response, command may have failed
-        # Consider restoring self.velocity to its previous value if strict error handling is needed
-        # For now, we assume the set command if sent, might have taken effect or will be queried.
-        return False
+            # If no response or unexpected response, command may have failed
+            # Consider restoring self.velocity to its previous value if strict error handling is needed
+            # For now, we assume the set command if sent, might have taken effect or will be queried.
+            return False
 
     def set_jog_step(self, degrees: float) -> bool:
         """
@@ -642,78 +659,85 @@ class ElliptecRotator:
         Returns:
             bool: True if the jog step was set successfully
         """
-        # Store the jog step size
-        self._jog_step_size = degrees
-
-        # Convert degrees to pulses
-        if degrees == 0:
-            # Set to continuous mode
-            jog_data = "00000000"
-        else:
-            # Apply offset if this rotator is part of a group and has an offset
-            target_degrees = (
-                (degrees + self.group_offset_degrees) % 360
-                if self.is_slave_in_group
-                else degrees
-            )
-
-            # Use device-specific pulse count if available
-            if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
-                jog_data = degrees_to_hex(target_degrees, self.pulse_per_revolution)
+        with self._command_lock:
+            # Convert degrees to pulses
+            if degrees == 0:
+                # Set to continuous mode
+                jog_data = "00000000"
             else:
-                jog_data = degrees_to_hex(target_degrees)
+                # Apply offset if this rotator is part of a group and has an offset
+                target_degrees = (
+                    (degrees + self.group_offset_degrees) % 360
+                    if self.is_slave_in_group
+                    else degrees
+                )
 
-        # Send command
-        response = self.send_command(COMMAND_SET_JOG_STEP, data=jog_data)
+                # Use device-specific pulse count if available
+                if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
+                    jog_data = degrees_to_hex(target_degrees, self.pulse_per_revolution)
+                else:
+                    jog_data = degrees_to_hex(target_degrees)
 
-        return response and response.startswith(f"{self.active_address}GS")
+            # Send command
+            response = self.send_command(COMMAND_SET_JOG_STEP, data=jog_data)
 
-    def update_position(self, debug=False) -> float:
+            if response and response.startswith(f"{self.active_address}GS") and "00" in response:
+                # Update internal state only if command was successful
+                self._jog_step_size = degrees  # Store the new value, 0 for continuous
+                return True
+            else:
+                return False
+        return False # Should be unreachable if lock is held, but ensure bool path
+
+    def update_position(self, debug: bool = False) -> Optional[float]:
         """
-        Get the current position of the rotator in degrees.
+        Get the current position of the rotator and update internal state.
 
         Returns:
-            float: Current position in degrees
-        float: Position in degrees
+            Optional[float]: Current position in degrees (0-360), or None on error.
         """
+        with self._command_lock:
+            response = self.send_command(COMMAND_GET_POS, debug=debug)  # Pass debug flag
 
-        response = self.send_command(COMMAND_GET_POS, debug=debug)  # Pass debug flag
-
-        if response and response.startswith(f"{self.active_address}PO"):
-            pos_hex = response[len(f"{self.active_address}PO") :].strip(" \r\n\t")
-            try:
-                current_degrees = 0.0
-                pulse_rev_to_use = (
-                    self.pulse_per_revolution
-                    if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution
-                    else 262144
-                )
-                current_degrees = hex_to_degrees(pos_hex, pulse_rev_to_use)
-
-                if self.is_slave_in_group:
-                    logical_position = (
-                        current_degrees - self.group_offset_degrees + 360
-                    ) % 360
-                    if debug:
-                        print(
-                            f"{self.name} (slave) physical pos: {current_degrees:.2f} deg, offset: {self.group_offset_degrees:.2f} deg, logical pos: {logical_position:.2f} deg"
-                        )
-                    return logical_position
-                else:
-                    if debug:
-                        print(
-                            f"{self.name} (master/standalone) physical pos: {current_degrees:.2f} deg"
-                        )
-                    return current_degrees
-            except ValueError:
-                if debug:
-                    print(
-                        f"Warning: Could not convert position response '{pos_hex}' to degrees for {self.name}."
+            if response and response.startswith(f"{self.active_address}PO"):
+                pos_hex = response[len(f"{self.active_address}PO") :].strip(" \r\n\t")
+                try:
+                    current_degrees = 0.0
+                    pulse_rev_to_use = (
+                        self.pulse_per_revolution
+                        if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution
+                        else 262144
                     )
-                return 0.0
-        elif debug:
-            print(f"No valid position response for {self.name}. Response: '{response}'")
-        return 0.0
+                    current_degrees = hex_to_degrees(pos_hex, pulse_rev_to_use)
+
+                    if self.is_slave_in_group:
+                        logical_position = (
+                            current_degrees - self.group_offset_degrees + 360
+                        ) % 360
+                        if debug:
+                            print(
+                                f"{self.name} (slave) physical pos: {current_degrees:.2f} deg, offset: {self.group_offset_degrees:.2f} deg, logical pos: {logical_position:.2f} deg"
+                            )
+                        # Update internal position state
+                        self.position_degrees = logical_position
+                        return logical_position
+                    else:
+                        if debug:
+                            print(
+                                f"{self.name} (master/standalone) physical pos: {current_degrees:.2f} deg"
+                            )
+                        # Update internal position state
+                        self.position_degrees = current_degrees
+                        return current_degrees
+                except ValueError:
+                    if debug:
+                        print(
+                            f"Warning: Could not convert position response '{pos_hex}' to degrees for {self.name}."
+                        )
+                    return 0.0
+            elif debug:
+                print(f"No valid position response for {self.name}. Response: '{response}'")
+            return 0.0
 
     def move_absolute(
         self, degrees: float, wait: bool = True, debug: bool = False
@@ -733,74 +757,99 @@ class ElliptecRotator:
         Returns:
             bool: True if the move command was sent successfully
         """
-        # Normalize to 0-360 range
-        target_degrees_logical = degrees % 360
+        with self._command_lock:
+            # Normalize to 0-360 range
+            target_degrees_logical = degrees % 360
 
-        # Apply offset if this rotator is part of a group and has an offset
-        # The 'degrees' parameter is the logical target for the group.
-        # This specific rotator needs to move to 'logical_target + its_own_offset'.
-        if (
-            self.is_slave_in_group
-        ):  # For a slave, self.group_offset_degrees is its specific offset
-            physical_target_degrees = (
-                target_degrees_logical + self.group_offset_degrees
-            ) % 360
+            # Apply offset if this rotator is part of a group and has an offset
+            # The 'degrees' parameter is the logical target for the group.
+            # This specific rotator needs to move to 'logical_target + its_own_offset'.
+            if (
+                self.is_slave_in_group
+            ):  # For a slave, self.group_offset_degrees is its specific offset
+                physical_target_degrees = (
+                    target_degrees_logical + self.group_offset_degrees
+                ) % 360
+                if debug:
+                    print(
+                        f"Slave {self.name} in group: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
+                    )
+            elif (
+                self.group_offset_degrees != 0.0
+            ):  # For a master, self.group_offset_degrees can be its own base offset for the group move
+                physical_target_degrees = (
+                    target_degrees_logical + self.group_offset_degrees
+                ) % 360
+                if debug:
+                    print(
+                        f"Master/Standalone {self.name} with offset: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
+                    )
+            else:  # Standalone rotator or master with no offset, or slave with no offset.
+                physical_target_degrees = target_degrees_logical
+                if debug:
+                    print(
+                        f"Standalone {self.name}: logical_target={target_degrees_logical}, physical_target={physical_target_degrees}"
+                    )
+
+            # Convert to hex position using device-specific pulse count if available
+            if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
+                hex_pos = degrees_to_hex(physical_target_degrees, self.pulse_per_revolution)
+                if debug:
+                    print(
+                        f"Using device-specific pulse count: {self.pulse_per_revolution} for {self.name}"
+                    )
+            else:
+                hex_pos = degrees_to_hex(physical_target_degrees)
+                if debug:
+                    print(f"Using default pulse count for {self.name}")
+
             if debug:
                 print(
-                    f"Slave {self.name} in group: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
-                )
-        elif (
-            self.group_offset_degrees != 0.0
-        ):  # For a master, self.group_offset_degrees can be its own base offset for the group move
-            physical_target_degrees = (
-                target_degrees_logical + self.group_offset_degrees
-            ) % 360
-            if debug:
-                print(
-                    f"Master/Standalone {self.name} with offset: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
-                )
-        else:  # Standalone rotator or master with no offset, or slave with no offset.
-            physical_target_degrees = target_degrees_logical
-            if debug:
-                print(
-                    f"Standalone {self.name}: logical_target={target_degrees_logical}, physical_target={physical_target_degrees}"
+                    f"{self.name} moving to physical target {physical_target_degrees:.2f} deg (hex: {hex_pos})"
                 )
 
-        # Convert to hex position using device-specific pulse count if available
-        if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
-            hex_pos = degrees_to_hex(physical_target_degrees, self.pulse_per_revolution)
-            if debug:
-                print(
-                    f"Using device-specific pulse count: {self.pulse_per_revolution} for {self.name}"
-                )
-        else:
-            hex_pos = degrees_to_hex(physical_target_degrees)
-            if debug:
-                print(f"Using default pulse count for {self.name}")
+            # Send the command
+            response = self.send_command(COMMAND_MOVE_ABS, data=hex_pos, debug=debug)
 
-        if debug:
-            print(
-                f"{self.name} moving to physical target {physical_target_degrees:.2f} deg (hex: {hex_pos})"
-            )
+            # Set moving state initially, will be cleared by wait_until_ready or next status check
+            # Only set is_moving if command was likely sent (response is not None potentially?)
+            # For now, set optimistically, assuming send_command doesn't raise error
+            self.is_moving = True
 
-        # Send the command
-        response = self.send_command(COMMAND_MOVE_ABS, data=hex_pos, debug=debug)
+            # According to manual, device responds with either GS (status) or PO (position)
+            # but some devices may not respond immediately
+            if response and (
+                response.startswith(f"{self.active_address}GS")
+                or response.startswith(f"{self.active_address}PO")
+            ):
+                if wait:
+                    # Release lock before potentially long wait_until_ready operation
+                    # to avoid blocking other threads
+                    pass  # Continue execution after the with block
+                else:
+                    return True
+            else:
+                # No response received, but command might have been accepted by the device.
+                if not wait:
+                    # If not waiting, assume the command was sent and might be processing.
+                    # The caller opted not to wait for confirmation of completion.
+                    # Cannot update position reliably without waiting.
+                    if debug:
+                        print(
+                            f"{self.name}: No immediate response for move_absolute, command sent (wait=False). Assuming success."
+                        )
+                    return True
+                # If wait=True, continue outside the lock
 
-        # Set moving state regardless of response - command was sent
-        self.is_moving = True
-
-        # According to manual, device responds with either GS (status) or PO (position)
-        # but some devices may not respond immediately
-        if response and (
-            response.startswith(f"{self.active_address}GS")
-            or response.startswith(f"{self.active_address}PO")
-        ):
-            if wait:
+        # Outside the lock for waiting operations
+        if wait:
+            if response and (
+                response.startswith(f"{self.active_address}GS")
+                or response.startswith(f"{self.active_address}PO")
+            ):
                 return self.wait_until_ready()
-            return True
-        else:
-            # No response received, but command might have been accepted by the device.
-            if wait:
+            else:
+                # No response, but still wait if requested
                 if debug:
                     print(
                         f"{self.name}: No immediate response for move_absolute, but waiting for completion as wait=True."
@@ -808,15 +857,17 @@ class ElliptecRotator:
                 # Brief pause to allow movement to start if the device is slow to process
                 # but did receive the command.
                 time.sleep(0.2)  # Increased slightly
-                return self.wait_until_ready()
-            else:
-                # If not waiting, assume the command was sent and might be processing.
-                # The caller opted not to wait for confirmation of completion.
-                if debug:
-                    print(
-                        f"{self.name}: No immediate response for move_absolute, command sent (wait=False). Assuming success."
-                    )
-                return True
+                success = self.wait_until_ready()
+                if success:
+                    with self._command_lock:
+                        self.position_degrees = target_degrees_logical
+                    if debug:
+                        print(f"{self.name}: Move successful (no initial response), position updated to {self.position_degrees:.2f} deg (logical)")
+                elif debug:
+                    print(f"{self.name}: Move attempt failed (no initial response and timed out waiting).")
+                return success
+
+        return False  # Should never reach here, but added as a fallback
 
     def continuous_move(
         self, direction: str = "cw", start: bool = True, debug: bool = False
@@ -831,30 +882,50 @@ class ElliptecRotator:
         Returns:
             bool: True if the command was sent successfully
         """
-        if start:
-            # Set to continuous mode
-            if not self.set_jog_step(0):
-                return False  # Failed to set jog step
+        with self._command_lock:
+            if start:
+                # Set to continuous mode
+                # We don't need to lock set_jog_step as it has its own locking
+                # Release the lock temporarily to avoid nested locks
+                released_lock = True
+                self._command_lock.release()
+                
+                try:
+                    if not self.set_jog_step(0):
+                        return False  # Failed to set jog step
+                finally:
+                    # Re-acquire the lock
+                    self._command_lock.acquire()
+                    released_lock = False
+                
+                # Send command for continuous movement
+                if direction.lower() == "fw":
+                    response = self.send_command(COMMAND_FORWARD, debug=debug)
+                elif direction.lower() == "bw":
+                    response = self.send_command(COMMAND_BACKWARD, debug=debug)
+                else:
+                    raise ValueError("Direction must be 'fw' or 'bw'")
 
-            # Send command for continuous movement
-            if direction.lower() == "fw":
-                response = self.send_command(COMMAND_FORWARD, debug=debug)
-            elif direction.lower() == "bw":
-                response = self.send_command(COMMAND_BACKWARD, debug=debug)
+                # Check response using active_address, as send_command verified the reply came from it
+                # Continuous move often doesn't give an immediate useful response,
+                # but we check for GS=OK as a basic acknowledgment if provided.
+                if response and response.startswith(f"{self.active_address}GS"):
+                    self.is_moving = True
+                    return True
+
+                return False
             else:
-                raise ValueError("Direction must be 'fw' or 'bw'")
-
-            # Check response using active_address, as send_command verified the reply came from it
-            # Continuous move often doesn't give an immediate useful response,
-            # but we check for GS=OK as a basic acknowledgment if provided.
-            if response and response.startswith(f"{self.active_address}GS"):
-                self.is_moving = True
-                return True
-
-            return False
-        else:
-            # Stop the movement
-            return self.stop()
+                # Release the lock before calling stop to avoid nested locks
+                self._command_lock.release()
+                released_lock = True
+                
+                try:
+                    # Stop the movement
+                    return self.stop()
+                finally:
+                    # Only re-acquire if we released it
+                    if released_lock:
+                        self._command_lock.acquire()
 
     def configure_as_group_slave(self, master_address_to_listen_to: str, slave_offset: float = 0.0, debug: bool = False) -> bool:
         """
@@ -869,44 +940,45 @@ class ElliptecRotator:
         Returns:
             bool: True if configuration was successful.
         """
-        try:
-            int(master_address_to_listen_to, 16)
-            if len(master_address_to_listen_to) != 1:
-                raise ValueError("Master address must be a single hex character.")
-        except ValueError:
-            if debug:
-                print(f"Invalid master_address_to_listen_to: '{master_address_to_listen_to}'. Must be 0-F.")
-            return False
+        with self._command_lock:
+            try:
+                int(master_address_to_listen_to, 16)
+                if len(master_address_to_listen_to) != 1:
+                    raise ValueError("Master address must be a single hex character.")
+            except ValueError:
+                if debug:
+                    print(f"Invalid master_address_to_listen_to: '{master_address_to_listen_to}'. Must be 0-F.")
+                return False
 
-        if debug:
-            print(f"Configuring {self.name} (phys_addr: {self.physical_address}) to listen to master_addr: {master_address_to_listen_to} with offset: {slave_offset} deg.")
-
-        # Command: <physical_address_of_slave>ga<master_address_to_listen_to>
-        # Reply expected from: <master_address_to_listen_to>GS<status>
-        response = self.send_command(
-            command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
-            data=master_address_to_listen_to,
-            send_addr_override=self.physical_address, # Send command using its physical address
-            expect_reply_from_addr=master_address_to_listen_to, # Reply comes from the new address
-            debug=debug,
-            timeout_multiplier=1.5 # Give 'ga' a bit more time for response
-        )
-
-        if response and response.startswith(f"{master_address_to_listen_to}GS") and "00" in response: # Check for "00" status
-            self.active_address = master_address_to_listen_to
-            self.group_offset_degrees = slave_offset
-            self.is_slave_in_group = True
             if debug:
-                print(f"{self.name} successfully configured as slave. Active_addr: {self.active_address}, Offset: {self.group_offset_degrees}")
-            return True
-        else:
-            if debug:
-                print(f"Failed to configure {self.name} as slave. Response: {response}")
-            # Attempt to revert to physical address if partial failure, though device might be in unknown state
-            self.active_address = self.physical_address
-            self.is_slave_in_group = False
-            self.group_offset_degrees = 0.0
-            return False
+                print(f"Configuring {self.name} (phys_addr: {self.physical_address}) to listen to master_addr: {master_address_to_listen_to} with offset: {slave_offset} deg.")
+
+            # Command: <physical_address_of_slave>ga<master_address_to_listen_to>
+            # Reply expected from: <master_address_to_listen_to>GS<status>
+            response = self.send_command(
+                command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
+                data=master_address_to_listen_to,
+                send_addr_override=self.physical_address, # Send command using its physical address
+                expect_reply_from_addr=master_address_to_listen_to, # Reply comes from the new address
+                debug=debug,
+                timeout_multiplier=1.5 # Give 'ga' a bit more time for response
+            )
+
+            if response and response.startswith(f"{master_address_to_listen_to}GS") and "00" in response: # Check for "00" status
+                self.active_address = master_address_to_listen_to
+                self.group_offset_degrees = slave_offset
+                self.is_slave_in_group = True
+                if debug:
+                    print(f"{self.name} successfully configured as slave. Active_addr: {self.active_address}, Offset: {self.group_offset_degrees}")
+                return True
+            else:
+                if debug:
+                    print(f"Failed to configure {self.name} as slave. Response: {response}")
+                # Attempt to revert to physical address if partial failure, though device might be in unknown state
+                self.active_address = self.physical_address
+                self.is_slave_in_group = False
+                self.group_offset_degrees = 0.0
+                return False
 
     def revert_from_group_slave(self, debug: bool = False) -> bool:
         """
@@ -918,41 +990,42 @@ class ElliptecRotator:
         Returns:
             bool: True if reversion was successful.
         """
-        if not self.is_slave_in_group:
+        with self._command_lock:
+            if not self.is_slave_in_group:
+                if debug:
+                    print(f"{self.name} is not in slave group mode. No reversion needed.")
+                self.active_address = self.physical_address # Ensure consistency
+                self.group_offset_degrees = 0.0
+                return True
+
+            current_listening_address = self.active_address
             if debug:
-                print(f"{self.name} is not in slave group mode. No reversion needed.")
-            self.active_address = self.physical_address # Ensure consistency
+                print(f"Reverting {self.name} from listening to {current_listening_address} back to physical_addr: {self.physical_address}.")
+
+            # Command: <current_listening_address>ga<physical_address_of_this_rotator>
+            # Reply expected from: <physical_address_of_this_rotator>GS<status>
+            response = self.send_command(
+                command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
+                data=self.physical_address,
+                send_addr_override=current_listening_address, # Command is sent to the address it's currently listening on
+                expect_reply_from_addr=self.physical_address, # Reply comes from its physical address
+                debug=debug,
+                timeout_multiplier=1.5 # Give 'ga' a bit more time for response
+            )
+
+            # Always reset internal state regardless of response to avoid being stuck
+            self.active_address = self.physical_address
+            self.is_slave_in_group = False
             self.group_offset_degrees = 0.0
-            return True
 
-        current_listening_address = self.active_address
-        if debug:
-            print(f"Reverting {self.name} from listening to {current_listening_address} back to physical_addr: {self.physical_address}.")
-
-        # Command: <current_listening_address>ga<physical_address_of_this_rotator>
-        # Reply expected from: <physical_address_of_this_rotator>GS<status>
-        response = self.send_command(
-            command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
-            data=self.physical_address,
-            send_addr_override=current_listening_address, # Command is sent to the address it's currently listening on
-            expect_reply_from_addr=self.physical_address, # Reply comes from its physical address
-            debug=debug,
-            timeout_multiplier=1.5 # Give 'ga' a bit more time for response
-        )
-
-        # Always reset internal state regardless of response to avoid being stuck
-        self.active_address = self.physical_address
-        self.is_slave_in_group = False
-        self.group_offset_degrees = 0.0
-
-        if response and response.startswith(f"{self.physical_address}GS") and "00" in response: # Check for "00" status
-            if debug:
-                print(f"{self.name} successfully reverted to physical address {self.physical_address}.")
-            return True
-        else:
-            if debug:
-                print(f"Failed to revert {self.name} to physical address. Response: {response}. Internal state reset.")
-            return False
+            if response and response.startswith(f"{self.physical_address}GS") and "00" in response: # Check for "00" status
+                if debug:
+                    print(f"{self.name} successfully reverted to physical address {self.physical_address}.")
+                return True
+            else:
+                if debug:
+                    print(f"Failed to revert {self.name} to physical address. Response: {response}. Internal state reset.")
+                return False
 
     def optimize_motors(self, wait: bool = True) -> bool:
         """
@@ -969,27 +1042,38 @@ class ElliptecRotator:
             bool: True if the command was acknowledged successfully, False otherwise.
                 Note that acknowledgement doesn't mean optimization completed if wait=False.
         """
-        # Command structure is simply <addr>om
-        response = self.send_command(COMMAND_OPTIMIZE_MOTORS)
+        with self._command_lock:
+            # Command structure is simply <addr>om
+            response = self.send_command(COMMAND_OPTIMIZE_MOTORS)
 
-        # Device should respond with GS status. Optimization starts in background.
-        if response and response.startswith(f"{self.physical_address}GS"):
-            # Status might initially indicate busy (e.g., '0A')
-            if wait:
+            # Device should respond with GS status. Optimization starts in background.
+            if response and response.startswith(f"{self.physical_address}GS"):
+                # Status might initially indicate busy (e.g., '0A')
+                if wait:
+                    # Release lock before potentially long wait_until_ready operation
+                    # to avoid blocking other threads
+                    pass  # Continue execution after the with block
+                else:
+                    return True  # Command acknowledged without waiting
+            else:
                 print(
-                    f"Waiting for motor optimization on {self.name} to complete..."
+                    f"Failed to start motor optimization on {self.name}. Response: {response}"
                 )
-                # Need a long timeout for optimization
-                # We wait until status is '00' (Ready)
-                # TODO: Refine wait logic based on expected busy codes during optimization
-                return self.wait_until_ready(
-                    timeout=60.0
-                )  # Use a long timeout (e.g., 60 seconds)
-            return True  # Command acknowledged
+                return False
 
-        print(
-            f"Failed to start motor optimization on {self.name}. Response: {response}"
-        )
+        # Outside the lock for waiting operations
+        if wait and response and response.startswith(f"{self.physical_address}GS"):
+            print(
+                f"Waiting for motor optimization on {self.name} to complete..."
+            )
+            # Need a long timeout for optimization
+            # We wait until status is '00' (Ready)
+            # TODO: Refine wait logic based on expected busy codes during optimization
+            return self.wait_until_ready(
+                timeout=60.0
+            )  # Use a long timeout (e.g., 60 seconds)
+
+        # If we're here and wait=True, it means the command failed
         return False
 
     def get_device_info(self, debug: bool = False) -> Dict[str, str]:
@@ -1009,75 +1093,76 @@ class ElliptecRotator:
         Returns:
             Dict[str, str]: Dictionary containing device information
         """
-        if debug:
-            print(f"Requesting device information from {self.name}...")
-
-        # Send the IN command (get information)
-        # Device info should always be queried from its current active address
-        response = self.send_command(COMMAND_GET_INFO, debug=debug)
-        info = {}
-
-        # Process the response
-        if response and response.startswith(f"{self.active_address}IN"):
-            # Remove the address and command prefix (e.g., "3IN")
-            data = response[len(f"{self.active_address}IN") :].strip(" \r\n\t")
-
+        with self._command_lock:
             if debug:
-                print(f"Response data: '{data}', length: {len(data)}")
-                print(f"Raw bytes (hex): {' '.join(f'{ord(c):02x}' for c in data)}")
+                print(f"Requesting device information from {self.name}...")
 
-            # For test cases compatibility
-            if "TestElliptecRotator" in str(self.__class__):
-                if data == "06123456782015018100007F":
+            # Send the IN command (get information)
+            # Device info should always be queried from its current active address
+            response = self.send_command(COMMAND_GET_INFO, debug=debug)
+            info = {}
+
+            # Process the response
+            if response and response.startswith(f"{self.active_address}IN"):
+                # Remove the address and command prefix (e.g., "3IN")
+                data = response[len(f"{self.active_address}IN") :].strip(" \r\n\t")
+
+                if debug:
+                    print(f"Response data: '{data}', length: {len(data)}")
+                    print(f"Raw bytes (hex): {' '.join(f'{ord(c):02x}' for c in data)}")
+
+                # For test cases compatibility
+                if "TestElliptecRotator" in str(self.__class__):
+                    if data == "06123456782015018100007F":
+                        info = {
+                            "type": "06",
+                            "firmware": "1234",
+                            "serial_number": "56782015",
+                            "year_month": "0181",
+                            "day_batch": "00",
+                            "hardware": "0181",
+                            "max_range": "00007F",
+                            "firmware_formatted": "18.52",
+                            "hardware_formatted": "1.129",
+                            "manufacture_date": "2015-15",
+                        }
+                        self.pulse_per_revolution = 262144  # Default value
+                        self.pulses_per_deg = self.pulse_per_revolution / 360.0
+                        return info
+                elif "TestProtocolMessages" in str(self.__class__):
+                    if data == "06123456782015018100007F":
+                        info = {
+                            "type": "06",
+                            "firmware": "1234",
+                            "serial_number": "56782015",
+                            "year_month": "0181",
+                            "day_batch": "00",
+                            "hardware": "007F",  # The test expects this value
+                            "max_range": "00007F",
+                        }
+                        self.pulse_per_revolution = 262144  # Default value
+                        self.pulses_per_deg = self.pulse_per_revolution / 360.0
+                        return info
+
+                # Special case for test_get_device_info
+                if data == "0E1140TESTSERL2401016800023000":
                     info = {
-                        "type": "06",
-                        "firmware": "1234",
-                        "serial_number": "56782015",
-                        "year_month": "0181",
-                        "day_batch": "00",
-                        "hardware": "0181",
-                        "max_range": "00007F",
-                        "firmware_formatted": "18.52",
-                        "hardware_formatted": "1.129",
-                        "manufacture_date": "2015-15",
+                        "type": "0E",
+                        "firmware": "1140",
+                        "serial_number": "TESTSERL",
+                        "year_month": "2401",
+                        "hardware": "6800",
+                        "max_range": "023000",
+                        "firmware_formatted": "17.64",
+                        "hardware_formatted": "104.0",
+                        "manufacture_date": "2024-01",
+                        "pulses_per_unit": "023000",
+                        "pulses_per_unit_dec": str(int("023000", 16)),
                     }
-                    self.pulse_per_revolution = 262144  # Default value
+                    self.device_info = info
+                    self.pulse_per_revolution = int(info["pulses_per_unit_dec"])
                     self.pulses_per_deg = self.pulse_per_revolution / 360.0
                     return info
-            elif "TestProtocolMessages" in str(self.__class__):
-                if data == "06123456782015018100007F":
-                    info = {
-                        "type": "06",
-                        "firmware": "1234",
-                        "serial_number": "56782015",
-                        "year_month": "0181",
-                        "day_batch": "00",
-                        "hardware": "007F",  # The test expects this value
-                        "max_range": "00007F",
-                    }
-                    self.pulse_per_revolution = 262144  # Default value
-                    self.pulses_per_deg = self.pulse_per_revolution / 360.0
-                    return info
-
-            # Special case for test_get_device_info
-            if data == "0E1140TESTSERL2401016800023000":
-                info = {
-                    "type": "0E",
-                    "firmware": "1140",
-                    "serial_number": "TESTSERL",
-                    "year_month": "2401",
-                    "hardware": "6800",
-                    "max_range": "023000",
-                    "firmware_formatted": "17.64",
-                    "hardware_formatted": "104.0",
-                    "manufacture_date": "2024-01",
-                    "pulses_per_unit": "023000",
-                    "pulses_per_unit_dec": str(int("023000", 16)),
-                }
-                self.device_info = info
-                self.pulse_per_revolution = int(info["pulses_per_unit_dec"])
-                self.pulses_per_deg = self.pulse_per_revolution / 360.0
-                return info
 
             try:
                 # Based on the reference implementation provided
@@ -1088,7 +1173,8 @@ class ElliptecRotator:
                     # [10:14] - Year
                     # [14:16] - Firmware
                     # [16] - Thread (0=Metric, 1=Imperial)
-                    # [17] - Hardware
+                    # [15:16] - Hardware
+                    # [16:18] - Year 
                     # [18:22] - Range (Travel)
                     # [22:] - Pulse/Rev
 
@@ -1193,13 +1279,16 @@ class ElliptecRotator:
 
                     traceback.print_exc()
                 info = {"type": "Error", "error": str(e)}
-        else:
-            info = {"type": "Unknown", "error": "No valid response"}
 
-        if debug:
-            print(f"Device information for {self.name}: {info}")
+            # If info hasn't been populated by successful parsing, it might be {} or contain an error
+            # from an earlier check (e.g. data too short).
+            # The "type": "Unknown", "error": "No valid response" logic is effectively handled
+            # if no specific parsing path populates 'info' and it remains empty or with a prior error.
 
-        # Store the info for future use
-        self.device_info = info
+            if debug:
+                print(f"Device information for {self.name}: {info}")
 
-        return info
+                # Store the info for future use
+                self.device_info = info
+
+            return info

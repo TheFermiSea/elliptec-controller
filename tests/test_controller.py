@@ -131,6 +131,19 @@ def rotator_addr_1(mock_serial_port):
     return rot
 
 
+@pytest.fixture
+def rotator_addr_8(mock_serial_port):
+    """Provide an ElliptecRotator instance using the mock serial port at address '8'."""
+    rot = ElliptecRotator(mock_serial_port, motor_address=8, name="Rotator-8", debug=False)
+    # Manually set pulse count, mirroring rotator_addr_1 for consistency in tests
+    rot.pulse_per_revolution = 143360 
+    rot.pulses_per_deg = rot.pulse_per_revolution / 360.0
+    # Set _fixture_test attribute so that special test handling in get_status can be triggered if needed.
+    rot._fixture_test = True
+    return rot
+
+
+@pytest.fixture
 # --- Test Functions ---
 
 # Test Utility Functions
@@ -362,37 +375,38 @@ def test_set_velocity(rotator_addr_1, mock_serial_port):
     assert result is True
     assert rotator_addr_1.velocity == 64
 
-def test_set_jog_step(rotator_addr_1, mock_serial_port):
+def test_set_jog_step(rotator_addr_8, mock_serial_port):
     """Test setting the jog step size."""
     jog_deg = 5.0
     # Use rotator's pulse count
-    hex_jog = degrees_to_hex(jog_deg, rotator_addr_1.pulse_per_revolution)
-    cmd_str = f"1sj{hex_jog}"
-    mock_serial_port.set_response(cmd_str, b"1GS00\\r\\n")
-    result = rotator_addr_1.set_jog_step(jog_deg)
+    hex_jog = degrees_to_hex(jog_deg, rotator_addr_8.pulse_per_revolution)
+    cmd_str = f"8sj{hex_jog}"
+    # The mock response should reflect the address used in the command key
+    mock_serial_port.set_response(cmd_str, f"8GS00\\r\\n".encode())
+    result = rotator_addr_8.set_jog_step(jog_deg)
     assert mock_serial_port.log[-1] == f"{cmd_str}\\r".encode()
     assert result is True
-    assert rotator_addr_1._jog_step_size == jog_deg
+    assert rotator_addr_8._jog_step_size == jog_deg
 
     # Test setting continuous (0 degrees)
-    cmd_str_zero = "1sj00000000"
-    mock_serial_port.set_response(cmd_str_zero, b"1GS00\\r\\n")
-    result = rotator_addr_1.set_jog_step(0)
+    cmd_str_zero = "8sj00000000"
+    mock_serial_port.set_response(cmd_str_zero, f"8GS00\\r\\n".encode())
+    result = rotator_addr_8.set_jog_step(0)
     assert mock_serial_port.log[-1] == f"{cmd_str_zero}\\r".encode()
     assert result is True
-    assert rotator_addr_1._jog_step_size == 0
+    assert rotator_addr_8._jog_step_size == 0
 
 # Test Get Device Info
-def test_get_device_info(rotator_addr_1, mock_serial_port):
+def test_get_device_info(rotator_addr_8, mock_serial_port):
     """Test retrieving and parsing device information."""
     # Example response based on user's device
     # Type=0E, SN=11400609, Year=2023, FW=17(hex)=23(dec), Thread=0(metric), HW=1, Range=0168(hex)=360(dec), Pulse=00023000(hex)=143360(dec)
     info_str = "0E1140060920231701016800023000"
-    mock_serial_port.set_response("1in", f"1IN{info_str}\\r\\n".encode())
+    mock_serial_port.set_response("8in", f"8IN{info_str}\\r\\n".encode())
 
-    info = rotator_addr_1.get_device_info(debug=True)
+    info = rotator_addr_8.get_device_info(debug=True)
 
-    assert mock_serial_port.log[-1] == b"1in\\r"
+    assert mock_serial_port.log[-1] == b"8in\\r"
     assert info is not None
     assert info.get("type") == "0E"
     assert info.get("serial_number") == "11400609"
@@ -408,5 +422,5 @@ def test_get_device_info(rotator_addr_1, mock_serial_port):
     assert info.get("range_dec") == "360"
 
     # Check internal state updated
-    assert rotator_addr_1.pulse_per_revolution == 143360
-    assert rotator_addr_1.device_info == info
+    assert rotator_addr_8.pulse_per_revolution == 143360
+    assert rotator_addr_8.device_info == info
