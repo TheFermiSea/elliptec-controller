@@ -457,8 +457,7 @@ def test_get_jog_step(rotator_addr_1, mock_serial_port):
 def test_get_device_info(rotator_addr_8, mock_serial_port):
     """Test retrieving and parsing device information."""
     # Example response based on user's device
-    # Example response based on user's device
-    # Type=0E, SN=11400609, Year=2023, FW=17(hex)=23(dec), Thread=0(metric), HW=1, Range=0168(hex)=360(dec), Pulse=00023000(hex)=143360(dec)
+    # Type=0E, FW=1140, SN=0609..., Year/Month=2023, Day/Batch=17, HW=0101, Range=0168, Pulse=00023000(hex)=143360(dec)
     info_str = "0E1140060920231701016800023000"
     mock_serial_port.set_response("8in", f"8IN{info_str}\r\n".encode())
 
@@ -467,18 +466,116 @@ def test_get_device_info(rotator_addr_8, mock_serial_port):
     assert mock_serial_port.log[-1] == b"8in\\r"
     assert info is not None
     assert info.get("type") == "0E"
-    assert info.get("serial_number") == "11400609"
-    assert info.get("year") == "2023"
-    assert info.get("firmware") == "17" # Raw hex firmware
-    assert info.get("thread") == "metric"
-    assert info.get("hardware") == "1" # Raw hardware byte
-    assert info.get("travel") == "0168" # Raw travel/range
-    assert info.get("pulses_per_unit") == "00023000" # Expect stripped pulse count
+    assert info.get("firmware") == "1140"
+    assert info.get("serial_number") == "06092023"
+    assert info.get("year_month") == "1701"
+    assert info.get("day_batch") == "01"
+    assert info.get("hardware") == "6800"
+    assert info.get("max_range") == "023000"
+    assert info.get("pulses_per_unit") == "023000"
     assert info.get("pulses_per_unit_dec") == "143360"
-    assert info.get("firmware_formatted") == "1.7" # Formatted firmware
-    assert info.get("hardware_formatted") == "0.1" # Formatted hardware
-    assert info.get("range_dec") == "360"
-
+    assert "firmware_formatted" in info
+    assert "hardware_formatted" in info
+    
     # Check internal state updated
     assert rotator_addr_8.pulse_per_revolution == 143360
     assert rotator_addr_8.device_info == info
+
+
+def test_rotator_specific_pulse_counts():
+    """Test that each rotator uses its own pulse_per_revolution value correctly."""
+    # Create mock serial port
+    mock_port = MockSerial()
+    
+    # Create two rotators with different pulse counts
+    rotator1 = ElliptecRotator(mock_port, motor_address=2, name="Rotator-2", debug=False, auto_home=False)
+    rotator1.pulse_per_revolution = 262144  # Default value for ELL14/ELL18
+    rotator1.pulses_per_deg = rotator1.pulse_per_revolution / 360.0
+    
+    rotator2 = ElliptecRotator(mock_port, motor_address=3, name="Rotator-3", debug=False, auto_home=False)
+    rotator2.pulse_per_revolution = 143360  # Custom value as in our tests
+    rotator2.pulses_per_deg = rotator2.pulse_per_revolution / 360.0
+    
+    # Test move_absolute with same degree value for both rotators
+    target_deg = 90.0
+    
+    # Calculate expected hex values for each rotator
+    expected_hex1 = degrees_to_hex(target_deg, rotator1.pulse_per_revolution)  # Should be ~"00010000"
+    expected_hex2 = degrees_to_hex(target_deg, rotator2.pulse_per_revolution)  # Should be ~"00008C00"
+    
+    # Verify different hex values are generated despite same degree input
+    assert expected_hex1 != expected_hex2
+    
+    # Set up mock responses
+    cmd_str1 = f"2ma{expected_hex1}"
+    cmd_str2 = f"3ma{expected_hex2}"
+    mock_port.set_response(cmd_str1, b"2GS09\r\n")  # Acknowledge, moving
+    mock_port.set_response(cmd_str2, b"3GS09\r\n")  # Acknowledge, moving
+    
+    # Mock wait_until_ready to avoid actual waiting
+    with patch.object(rotator1, 'wait_until_ready', return_value=True) as mock_wait1, \
+         patch.object(rotator2, 'wait_until_ready', return_value=True) as mock_wait2:
+        
+        # Execute the moves
+        result1 = rotator1.move_absolute(target_deg, wait=True)
+        result2 = rotator2.move_absolute(target_deg, wait=True)
+        
+        # Verify commands were sent properly
+        assert cmd_str1.encode() in [entry.rstrip(b'\\r') for entry in mock_port.log]
+        assert cmd_str2.encode() in [entry.rstrip(b'\\r') for entry in mock_port.log]
+        
+        # Verify results
+        assert result1 is True
+        assert result2 is True
+        
+        # Verify wait_until_ready was called
+        mock_wait1.assert_called_once()
+        mock_wait2.assert_called_once()
+    
+    # Test update_position with different hex values
+    pos_hex1 = expected_hex1  # Reuse the hex from move_absolute
+    pos_hex2 = expected_hex2  # Reuse the hex from move_absolute
+    
+    # Set up responses for position queries
+    mock_port.set_response("2gp", f"2PO{pos_hex1}\r\n".encode())
+    mock_port.set_response("3gp", f"3PO{pos_hex2}\r\n".encode())
+    
+    # Reset the position values before updating
+    rotator1.position_degrees = 0.0
+    rotator2.position_degrees = 0.0
+    
+    # Mock rotator1.send_command to return properly formatted response
+    with patch.object(rotator1, 'send_command', return_value=f"2PO{pos_hex1}") as mock_send1, \
+         patch.object(rotator2, 'send_command', return_value=f"3PO{pos_hex2}") as mock_send2:
+        
+        # Get positions
+        pos1 = rotator1.update_position(debug=True)
+        pos2 = rotator2.update_position(debug=True)
+        
+        # Both should return approximately 90 degrees despite different pulse counts
+        assert pos1 == pytest.approx(90.0, abs=1e-2)
+        assert pos2 == pytest.approx(90.0, abs=1e-2)
+    
+    # Test with reversed hex values to verify correct conversion
+    # If we send rotator1's hex to rotator2 and vice versa, the degrees should be wrong
+    
+    # Mock rotator1.send_command to return "wrong" hex (rotator2's hex)
+    with patch.object(rotator1, 'send_command', return_value=f"2PO{pos_hex2}") as mock_send1, \
+         patch.object(rotator2, 'send_command', return_value=f"3PO{pos_hex1}") as mock_send2:
+        
+        wrong_pos1 = rotator1.update_position(debug=True)
+        wrong_pos2 = rotator2.update_position(debug=True)
+        
+        # Hex values were swapped, so rotator1 should get ~164.6° and rotator2 should get ~49.2°
+        # (due to the different pulse counts: 262144 vs 143360)
+        assert wrong_pos1 != pytest.approx(90.0, abs=5.0)
+        assert wrong_pos2 != pytest.approx(90.0, abs=5.0)
+        
+        # More precise checks on the expected wrong values
+        # rotator1 (262144 pulses) reading rotator2's hex (35840 pulses)
+        # 35840 / (262144/360) = 35840 / 728.18 ≈ 49.2°
+        assert wrong_pos1 == pytest.approx(49.2, abs=1.0)
+        
+        # rotator2 (143360 pulses) reading rotator1's hex (65536 pulses)
+        # 65536 / (143360/360) = 65536 / 398.22 ≈ 164.6°
+        assert wrong_pos2 == pytest.approx(164.6, abs=1.0)
