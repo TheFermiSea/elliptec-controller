@@ -120,6 +120,7 @@ class ElliptecRotator:
         name: Optional[str] = None,
         group_address: Optional[int] = None,
         debug: bool = False,
+        auto_home: bool = True,
     ):
         """
         Initialize the Elliptec rotator.
@@ -130,6 +131,7 @@ class ElliptecRotator:
             name: Descriptive name for this rotator
             group_address: Optional group address for synchronous movement
             debug: Whether to print debug information
+            auto_home: Whether to automatically home the device and populate attributes during initialization
         """
         self.physical_address = str(motor_address)  # Device's actual hardware address
         self.active_address = (
@@ -165,6 +167,9 @@ class ElliptecRotator:
             self._fixture_test = True
             self._mock_in_test = True
             self.serial._log = self.serial._log if hasattr(self.serial, '_log') else []
+            
+            # For test fixtures, initialize position attribute
+            self.position_degrees = 0.0
         elif hasattr(port, 'write') and hasattr(port, 'read') and hasattr(port, 'flush'):  # Check for serial-like object
             self.serial = port
         elif isinstance(port, str):  # Check string
@@ -189,38 +194,40 @@ class ElliptecRotator:
                         print(f"Using pulses_per_deg: {self.pulses_per_deg}")
                         
                 # Populate other attributes by querying the device
-                try:
-                    # Home the rotator
-                    if debug:
-                        print(f"Homing {self.name}...")
-                    home_result = self.home(wait=True)
-                    if not home_result and debug:
-                        print(f"Warning: Failed to home {self.name}")
-                    
-                    # Get current position
-                    if debug:
-                        print(f"Getting position for {self.name}...")
-                    self.update_position(debug=debug)
-                    
-                    # Get current velocity
-                    if debug:
-                        print(f"Getting velocity for {self.name}...")
-                    velocity = self.get_velocity(debug=debug)
-                    if velocity is not None:
-                        self.velocity = velocity
-                    
-                    # Get current jog step
-                    if debug:
-                        print(f"Getting jog step for {self.name}...")
-                    jog_step = self.get_jog_step(debug=debug)
-                    if jog_step is not None:
-                        self._jog_step_size = jog_step
+                # Skip full initialization for tests with mock ports
+                if auto_home and not (hasattr(self, '_fixture_test') and self._fixture_test):
+                    try:
+                        # Home the rotator
+                        if debug:
+                            print(f"Homing {self.name}...")
+                        home_result = self.home(wait=True)
+                        if not home_result and debug:
+                            print(f"Warning: Failed to home {self.name}")
                         
-                    if debug:
-                        print(f"Initialization complete for {self.name}!")
-                except Exception as init_e:
-                    if debug:
-                        print(f"Error during attribute initialization: {init_e}")
+                        # Get current position
+                        if debug:
+                            print(f"Getting position for {self.name}...")
+                        self.update_position(debug=debug)
+                        
+                        # Get current velocity
+                        if debug:
+                            print(f"Getting velocity for {self.name}...")
+                        velocity = self.get_velocity(debug=debug)
+                        if velocity is not None:
+                            self.velocity = velocity
+                        
+                        # Get current jog step
+                        if debug:
+                            print(f"Getting jog step for {self.name}...")
+                        jog_step = self.get_jog_step(debug=debug)
+                        if jog_step is not None:
+                            self._jog_step_size = jog_step
+                            
+                        if debug:
+                            print(f"Initialization complete for {self.name}!")
+                    except Exception as init_e:
+                        if debug:
+                            print(f"Error during attribute initialization: {init_e}")
             except Exception as e:
                 if debug:
                     print(f"Error retrieving device info: {e}")
@@ -1178,13 +1185,17 @@ class ElliptecRotator:
 
             # Send the IN command (get information)
             # Device info should always be queried from its current active address
-            response = self.send_command(COMMAND_GET_INFO, debug=debug)
+            print(f"Requesting device info with command '{COMMAND_GET_INFO}' at address '{self.active_address}'")
+            response = self.send_command(COMMAND_GET_INFO, debug=True)  # Force debug for diagnostic
+            print(f"Response received: '{response}'")
             info = {}
 
             # Process the response
+            print(f"Raw response: '{response}'")
             if response and response.startswith(f"{self.active_address}IN"):
                 # Remove the address and command prefix (e.g., "3IN")
                 data = response[len(f"{self.active_address}IN") :].strip(" \r\n\t")
+                print(f"Parsed data: '{data}', length: {len(data)}")
 
                 if debug:
                     print(f"Response data: '{data}', length: {len(data)}")
@@ -1361,13 +1372,13 @@ class ElliptecRotator:
 
             # If info hasn't been populated by successful parsing, it might be {} or contain an error
             # from an earlier check (e.g. data too short).
-            # The "type": "Unknown", "error": "No valid response" logic is effectively handled
-            # if no specific parsing path populates 'info' and it remains empty or with a prior error.
+            if len(info) == 0:
+                print(f"WARNING: No device info parsed from response: '{response}'")
+                info = {"type": "Unknown", "error": f"Failed to parse response: '{response}'"}
 
-            if debug:
-                print(f"Device information for {self.name}: {info}")
+            print(f"Final device information for {self.name}: {info}")
 
-                # Store the info for future use
-                self.device_info = info
+            # Store the info for future use
+            self.device_info = info
 
             return info
