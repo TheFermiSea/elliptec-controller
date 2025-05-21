@@ -60,3 +60,6 @@ venv.bak/
 # OS specific files
 .DS_Store
 Thumbs.db
+# pixi environments
+.pixi
+*.egg-info
