@@ -26,7 +26,7 @@ target-version = ['py36', 'py37', 'py38', 'py39', 'py310']
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-[toolhatch.build.targets.wheel]
+[tool.hatch.build.targets.wheel]
 packages = "elliptec_controller"
 
 [tool.pixi.workspace]
