@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "elliptec-controller"
@@ -10,10 +10,7 @@ authors = [{ name = "Brian Squires", email = "squires.b@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.6"
 license = { file = "LICENSE" }
-dependencies = [
-    "ptpython>=3.0.7",
-    "pyserial>=3.5",
-]
+dependencies = ["ptpython>=3.0.7", "pyserial>=3.5"]
 urls = { repository = "https://github.com/TheFermiSea/elliptec-controller" }
 
 [project.optional-dependencies]
@@ -29,7 +26,7 @@ target-version = ['py36', 'py37', 'py38', 'py39', 'py310']
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-[tool.setuptools.build_meta.targets.wheel]
+[toolhatch.build.targets.wheel]
 packages = "elliptec_controller"
 
 [tool.pixi.workspace]
