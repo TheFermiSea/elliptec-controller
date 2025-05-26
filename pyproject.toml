@@ -20,6 +20,10 @@ dev = ["pytest>=6.0.0", "pytest-cov>=2.0.0"]
 [project.scripts]
 elliptec-controller = "elliptec_controller.cli:main"
 
+[package]
+name = "elliptec-controller"
+version = "0.1.0"
+
 [tool.black]
 line-length = 100
 target-version = ['py36', 'py37', 'py38', 'py39', 'py310']
@@ -28,7 +32,7 @@ target-version = ['py36', 'py37', 'py38', 'py39', 'py310']
 testpaths = ["tests"]
 
 [tool.hatch.build.targets.wheel]
-packages = "elliptec_controller"
+packages = ["elliptec_controller"]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
