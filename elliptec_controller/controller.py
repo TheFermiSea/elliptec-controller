@@ -187,6 +187,15 @@ class ElliptecRotator:
                 port=port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1
             )
 
+            # Flush buffers after opening port
+            try:
+                self.serial.reset_input_buffer()
+                self.serial.reset_output_buffer()
+            except serial.SerialException as e:
+                if debug: # Use the debug flag passed to __init__
+                    print(f"Error resetting serial port buffers for {self.name} during init: {e}")
+                # Decide if this should be fatal or not; for now, let it continue
+
             # Load device info and get pulse_per_revolution after connection is established
             try:
                 device_info = self.get_device_info(debug=True)  # Force debug for important device setup
@@ -1211,6 +1220,7 @@ class ElliptecRotator:
             response = self.send_command(COMMAND_GET_INFO, debug=True)  # Force debug for diagnostic
             print(f"[{self.name}] ID:{self.physical_address} Response received: '{response}'")
             info = {}
+            data = ""  # Initialize data to prevent UnboundLocalError
 
             # Process the response
             print(f"[{self.name}] ID:{self.physical_address} Raw response: '{response}'")
