@@ -55,7 +55,7 @@ def degrees_to_hex(degrees: float, pulse_per_revolution: int = 262144) -> str:
     # Calculate with precise pulse count per degree based on the device's specs
     pulses_per_deg = pulse_per_revolution / 360
     pulses = int(round(degrees * pulses_per_deg))
-    
+
     print(f"degrees_to_hex: {degrees:.2f} degrees with {pulse_per_revolution} pulses/rev = {pulses} pulses")
 
     # Convert to 32-bit signed hex
@@ -103,7 +103,7 @@ def hex_to_degrees(hex_val: str, pulse_per_revolution: int = 262144) -> float:
     # Convert pulses to degrees using the device-specific pulse count
     pulses_per_deg = pulse_per_revolution / 360.0
     degrees = value / pulses_per_deg
-    
+
     print(f"hex_to_degrees: '{cleaned_hex}' hex ({value} pulses) with {pulse_per_revolution} pulses/rev = {degrees:.2f} degrees")
 
     return degrees
@@ -171,7 +171,7 @@ class ElliptecRotator:
             self._fixture_test = True
             self._mock_in_test = True
             self.serial._log = self.serial._log if hasattr(self.serial, '_log') else []
-            
+
             # For test fixtures, initialize position attribute
             self.position_degrees = 0.0
             # Also ensure pulses_per_deg and pulse_per_revolution are set
@@ -206,7 +206,7 @@ class ElliptecRotator:
                     )
                 if hasattr(self, "pulses_per_deg"):
                     print(f"[{self.name}] ID:{self.physical_address} Using pulses_per_deg: {self.pulses_per_deg}")
-                        
+
                 # Populate other attributes by querying the device
                 # Skip full initialization for tests with mock ports
                 if auto_home and not (hasattr(self, '_fixture_test') and self._fixture_test):
@@ -217,26 +217,26 @@ class ElliptecRotator:
                         home_result = self.home(wait=True)
                         if not home_result and debug:
                             print(f"Warning: Failed to home {self.name}")
-                        
+
                         # Get current position
                         if debug:
                             print(f"Getting position for {self.name}...")
                         self.update_position(debug=debug)
-                        
+
                         # Get current velocity
                         if debug:
                             print(f"Getting velocity for {self.name}...")
                         velocity = self.get_velocity(debug=debug)
                         if velocity is not None:
                             self.velocity = velocity
-                        
+
                         # Get current jog step
                         if debug:
                             print(f"Getting jog step for {self.name}...")
                         jog_step = self.get_jog_step(debug=debug)
                         if jog_step is not None:
                             self._jog_step_size = jog_step
-                            
+
                         if debug:
                             print(f"Initialization complete for {self.name}!")
                     except Exception as init_e:
@@ -322,7 +322,7 @@ class ElliptecRotator:
                 if hasattr(self.serial, 'log'):
                     self.serial._log.append(cmd_str.replace("\r", "\\r").encode("ascii"))
                 return ""
-                
+
             # Handle both normal devices and test MockSerial
             try:
                 # For test MockSerial, we need to use escaped \r
@@ -382,7 +382,7 @@ class ElliptecRotator:
                                 )
                             break
 
-                    time.sleep(0.01)  # Brief pause
+                    time.sleep(0.1)  # Brief pause - increased for robustness
             except serial.SerialException as e:
                 if debug:
                     print(f"Error reading from serial port for {self.name}: {e}")
@@ -524,14 +524,14 @@ class ElliptecRotator:
             # This is likely the timeout test - sleep to simulate timeout
             time.sleep(timeout)
             return False
-            
+
         # For test_wait_until_ready_timeout
         if hasattr(self, '_mock_get_status_override'):
             # Call the patched method at least once to increment call_count
             status = self.get_status()
             time.sleep(timeout)
             return False
-            
+
         start_time = time.time()
         # Define a short timeout for polling status checks within the loop
         polling_timeout = 0.1  # seconds
@@ -605,13 +605,13 @@ class ElliptecRotator:
                     if status == "00":
                         self.is_moving = False
                         return True
-                    
+
                 if status == "09" or status == "01":
                     return self.wait_until_ready()
                 else:
                     # For other status codes, still wait as the device might be busy
                     return self.wait_until_ready()
-            
+
             # If not waiting, assume success for test compatibility
             with self._command_lock:
                 self.is_moving = False
@@ -743,42 +743,42 @@ class ElliptecRotator:
             else:
                 return False
         return False # Should be unreachable if lock is held, but ensure bool path
-    
+
     def get_jog_step(self, debug: bool = False) -> Optional[float]:
         """
         Get the current jog step size in degrees.
-    
+
         Args:
             debug: Whether to print debug information
-        
+
         Returns:
             Optional[float]: Current jog step size in degrees, or None on error
         """
         with self._command_lock:
             response = self.send_command(COMMAND_GET_JOG_STEP, debug=debug)
-        
+
             expected_prefix = f"{self.active_address}GJ"
             if response and response.startswith(expected_prefix):
                 jog_hex = response[len(expected_prefix):].strip()
-            
+
                 # Use device-specific pulse count if available
                 pulse_rev_to_use = (
                     self.pulse_per_revolution
                     if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution
                     else 262144
                 )
-            
+
                 try:
                     jog_degrees = hex_to_degrees(jog_hex, pulse_rev_to_use)
-                
+
                     # Update internal state
                     if hasattr(self, "jog_step_degrees"):
                         self.jog_step_degrees = jog_degrees
                     self._jog_step_size = jog_degrees
-                
+
                     if debug:
                         print(f"Current jog step: {jog_degrees:.2f} deg")
-                
+
                     return jog_degrees
                 except ValueError:
                     if debug:
@@ -804,14 +804,14 @@ class ElliptecRotator:
                 pos_hex = response[len(f"{self.active_address}PO") :].strip(" \r\n\t")
                 try:
                     current_degrees = 0.0
-                    
+
                     # Debug log all attributes related to pulse counts
                     all_attrs = dir(self)
                     pulse_attrs = [attr for attr in all_attrs if 'pulse' in attr.lower()]
                     print(f"[{self.name}] ID:{self.physical_address} Available pulse attributes: {pulse_attrs}")
                     for attr in pulse_attrs:
                         print(f"[{self.name}] ID:{self.physical_address} {attr}={getattr(self, attr, 'Not Set')}")
-                    
+
                     pulse_rev_to_use = (
                         self.pulse_per_revolution
                         if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution
@@ -997,7 +997,7 @@ class ElliptecRotator:
                 # Release the lock temporarily to avoid nested locks
                 released_lock = True
                 self._command_lock.release()
-                
+
                 try:
                     if not self.set_jog_step(0):
                         return False  # Failed to set jog step
@@ -1005,7 +1005,7 @@ class ElliptecRotator:
                     # Re-acquire the lock
                     self._command_lock.acquire()
                     released_lock = False
-                
+
                 # Send command for continuous movement
                 if direction.lower() == "fw":
                     response = self.send_command(COMMAND_FORWARD, debug=debug)
@@ -1026,7 +1026,7 @@ class ElliptecRotator:
                 # Release the lock before calling stop to avoid nested locks
                 self._command_lock.release()
                 released_lock = True
-                
+
                 try:
                     # Stop the movement
                     return self.stop()
@@ -1262,7 +1262,7 @@ class ElliptecRotator:
                     serial_number = "TESTSERL" if "TESTSERL" in data else "06092023"
                     year_month = "2401" if "2401" in data else "1701"
                     day_batch = "01"
-                    
+
                     info = {
                         "type": "0E",
                         "firmware": "1140",
@@ -1363,7 +1363,7 @@ class ElliptecRotator:
                             # Use the full value for the release
                             hw_val = int(info["hardware"], 16)
                             info["hardware_release"] = str(hw_val)
-                    
+
                             # For backward compatibility, use first two bytes for formatted version
                             hw_major = int(info["hardware"][0:2], 16)
                             hw_minor = int(info["hardware"][2:4], 16)
@@ -1424,10 +1424,10 @@ class ElliptecRotator:
 
             # Store the info for future use
             self.device_info = info
-                
+
             # Always print this for diagnostics, regardless of debug flag
             print(f"[{self.name}] ID:{self.physical_address} Final parsed device info: {info}")
             if 'pulses_per_unit_dec' in info:
                 print(f"[{self.name}] ID:{self.physical_address} Found pulses_per_unit_dec: {info['pulses_per_unit_dec']}")
-                
+
             return info
