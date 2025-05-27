@@ -1,197 +1,267 @@
 # Elliptec Controller
 
-A Python package for controlling Thorlabs Elliptec rotation stages (like ELL6, ELL14, etc.), providing an intuitive interface for optical control applications.
+A Python package for controlling Thorlabs Elliptec rotation stages (ELL6, ELL14, ELL18, etc.), providing an intuitive interface for optical control applications.
 
 ## Features
 
-- Control individual Elliptec rotation stages.
-- Support for relative and absolute positioning.
-- Device information retrieval (serial number, firmware, pulse counts).
-- Velocity and jog step control.
-- Two-device synchronized movement using group addressing with user-defined offsets.
-- Comprehensive command set implementation based on the ELLx protocol manual.
-- Thread-safe design for multi-threaded applications.
+- **Individual Rotator Control**: Control single Elliptec rotation stages with precise positioning
+- **Group Synchronization**: Coordinate multiple rotators with configurable offsets
+- **Comprehensive Protocol Support**: Full implementation of the ELLx protocol manual
+- **Thread-Safe Design**: Safe for use in multi-threaded applications
+- **Advanced Logging**: Detailed logging with Loguru for debugging and monitoring
+- **Device Information**: Automatic retrieval of device specifications and capabilities
+- **Position Conversion**: Seamless conversion between degrees and device-specific pulse counts
 
 ## Installation
+
+### From PyPI (Recommended)
 
 ```bash
 pip install elliptec-controller
 ```
 
-Or directly from the repository:
+### From Source
 
 ```bash
 git clone https://github.com/TheFermiSea/elliptec-controller.git
 cd elliptec-controller
-pip install .
+pip install -e .
 ```
 
-## Basic Usage (Single Rotator)
+### Development Installation
+
+```bash
+git clone https://github.com/TheFermiSea/elliptec-controller.git
+cd elliptec-controller
+pip install -e .[dev]
+```
+
+## Quick Start
+
+### Basic Single Rotator Control
+
+```python
+from elliptec_controller import ElliptecRotator
+from loguru import logger
+import sys
+
+# Configure logging (optional)
+logger.remove()
+logger.add(sys.stderr, level="INFO")
+
+# Initialize rotator
+rotator = ElliptecRotator(
+    port="/dev/ttyUSB0",    # Replace with your serial port
+    motor_address=1,        # Device address (0-15)
+    name="MyRotator"
+)
+
+# Basic operations
+rotator.home(wait=True)                    # Home the device
+rotator.move_absolute(45.0, wait=True)     # Move to 45 degrees
+position = rotator.update_position()       # Get current position
+print(f"Current position: {position:.2f}°")
+```
+
+### Command Line Interface
+
+The package includes a CLI tool for quick operations:
+
+```bash
+# Get device status
+elliptec-controller status --port /dev/ttyUSB0
+
+# Home all connected rotators
+elliptec-controller home --port /dev/ttyUSB0
+
+# Move specific rotator to position
+elliptec-controller move-abs --port /dev/ttyUSB0 --address 1 --position 90.0
+
+# Get device information
+elliptec-controller info --port /dev/ttyUSB0 --address 1
+```
+
+## Advanced Usage
+
+### Synchronized Group Movement
+
+Control multiple rotators simultaneously with individual offsets:
+
+```python
+from elliptec_controller import ElliptecRotator
+
+# Initialize rotators on the same serial port
+master = ElliptecRotator("/dev/ttyUSB0", motor_address=1, name="Master")
+slave = ElliptecRotator("/dev/ttyUSB0", motor_address=2, name="Slave")
+
+# Configure synchronization
+slave_offset = 30.0  # Slave will be offset by 30 degrees
+slave.configure_as_group_slave(master.physical_address, slave_offset)
+
+# Synchronized movement - both rotators move together
+target_angle = 45.0
+master.move_absolute(target_angle, wait=True)
+# Master moves to 45°, Slave moves to 75° (45° + 30° offset)
+
+# Cleanup
+slave.revert_from_group_slave()
+```
+
+### Error Handling and Robustness
 
 ```python
 import serial
 from elliptec_controller import ElliptecRotator
-import time
-
-# Using a specific serial port
-try:
-    # Create a rotator instance - this opens the port and gets device info
-    rotator1 = ElliptecRotator(
-        port="/dev/ttyUSB0",  # Replace with your serial port
-        motor_address=1,      # Replace with your device address (0-F)
-        name="Rotator1"
-        # Logging is now handled by Loguru.
-        # Configure Loguru in your application to see detailed logs.
-    )
-
-    # Print device info (retrieved during initialization)
-    print("Device Info:", rotator1.device_info)
-    print(f"Pulses per Revolution: {rotator1.pulse_per_revolution}")
-
-    # Home the rotator
-    print("Homing...")
-    rotator1.home(wait=True)
-    print("Homing complete.")
-    time.sleep(1)
-
-    # Move to an absolute position (in degrees)
-    print("Moving to 90 degrees...")
-    rotator1.move_absolute(90.0, wait=True)
-    print("Move complete.")
-    time.sleep(1)
-
-    # Get the current position
-    position = rotator1.update_position()
-    print(f"Current position: {position:.2f} degrees")
-
-    # Clean up (closes the serial port implicitly if opened by the class)
-    # No explicit close needed if port name was passed to constructor
-
-except serial.SerialException as e:
-    print(f"Serial port error: {e}")
-except Exception as e:
-    print(f"An error occurred: {e}")
-
-```
-
-## Two-Device Synchronized Movement with Offset
-
-This example shows how to synchronize two rotators connected to the *same* serial port using the group addressing feature. One rotator acts as the "master" (commands are sent to its address), and the other acts as the "slave" (configured to listen to the master's address).
-
-```python
-import serial
-from elliptec_controller import ElliptecRotator
-import time
-
-# Note: Both rotators must be on the same serial port for this to work.
-SERIAL_PORT = "/dev/ttyUSB0" # Replace with your serial port
-MASTER_ADDR = 1            # Replace with master's address (0-F)
-SLAVE_ADDR = 2             # Replace with slave's address (0-F)
+from loguru import logger
 
 try:
-    # Use context managers for reliable port handling if sharing a port manually
-    # If passing port name to ElliptecRotator, it handles opening/closing.
-    # Here, we instantiate them separately.
-    master_rot = ElliptecRotator(SERIAL_PORT, MASTER_ADDR, "Master")
-    slave_rot = ElliptecRotator(SERIAL_PORT, SLAVE_ADDR, "Slave")
-
-    # --- Synchronization Setup ---
-    slave_offset_deg = 30.0  # Slave will move to (target + 30 degrees)
-    master_offset_deg = 0.0  # Master moves to target directly
-
-    print(f"Configuring Slave (Addr {slave_rot.physical_address}) to listen to Master (Addr {master_rot.physical_address}) with {slave_offset_deg} deg offset...")
-    if slave_rot.configure_as_group_slave(master_rot.physical_address, slave_offset_deg):
-        print("Slave configured successfully.")
-        # Optionally set an offset for the master itself for the group move
-        master_rot.group_offset_degrees = master_offset_deg
+    rotator = ElliptecRotator("/dev/ttyUSB0", motor_address=1)
+    
+    # Check device readiness
+    if not rotator.is_ready():
+        logger.warning("Device not ready, attempting to home...")
+        if not rotator.home(wait=True):
+            raise RuntimeError("Failed to home device")
+    
+    # Perform operations with error checking
+    if rotator.move_absolute(90.0, wait=True):
+        logger.info("Move completed successfully")
     else:
-        print("Failed to configure slave!")
-        raise RuntimeError("Slave configuration failed")
-
-    # --- Perform Synchronized Move ---
-    target_angle = 45.0
-    print(f"Sending synchronized move command to Master address {master_rot.physical_address} for logical target {target_angle} deg...")
-    # Command is sent to master_rot's address. Both master and slave (listening on master's addr) will react.
-    # Each applies its own offset internally.
-    if master_rot.move_absolute(target_angle, wait=True):
-        print("Synchronized move command sent and completed.")
-    else:
-        print("Synchronized move failed.")
-
-    time.sleep(1)
-    # Verify positions (update_position handles offset adjustment for slaves)
-    master_pos = master_rot.update_position()
-    slave_pos_logical = slave_rot.update_position() # update_position returns the logical position for a slave
-    print(f"Master final position: {master_pos:.2f} deg (Expected physical: {target_angle + master_offset_deg:.2f})")
-    # Note: Slave's *physical* position would be target_angle + slave_offset_deg
-    # update_position for a slave returns the logical position (physical - offset)
-    print(f"Slave final logical position: {slave_pos_logical:.2f} deg (Expected logical: {target_angle:.2f})")
-
-
-    # --- Revert Synchronization ---
-    print("Reverting slave from group mode...")
-    if slave_rot.revert_from_group_slave():
-        print("Slave reverted successfully.")
-    else:
-        print("Failed to revert slave.")
-    master_rot.group_offset_degrees = 0.0 # Clear master offset too
-
-    # Rotators now respond to their individual physical addresses again.
-
+        logger.error("Move operation failed")
+        
 except serial.SerialException as e:
-    print(f"Serial port error: {e}")
+    logger.error(f"Serial communication error: {e}")
 except Exception as e:
-    print(f"An error occurred: {e}")
-finally:
-    # Ensure ports are closed if necessary - ElliptecRotator closes implicitly
-    # if it opened the port based on a string name. If you passed an open
-    # serial object, you might need to close it manually here.
-    print("Cleanup done.")
-
+    logger.error(f"Unexpected error: {e}")
+    # Emergency stop if needed
+    try:
+        rotator.stop()
+    except:
+        pass
 ```
 
-## Documentation
+## Device Compatibility
 
-For detailed documentation on all available commands and features, please refer to the [Thorlabs Elliptec documentation](https://www.thorlabs.com/newgrouppage9.cfm?objectgroup_id=9252) and the docstrings within the code.
+This package supports Thorlabs Elliptec rotation stages including:
+
+- **ELL6**: 360° rotation mount
+- **ELL14**: 360° rotation mount with encoder
+- **ELL18**: 360° rotation mount with high resolution
+
+The package automatically detects device-specific parameters such as:
+- Pulses per revolution
+- Travel range
+- Firmware version
+- Serial number
+
+## Hardware Setup
+
+1. **Connect Hardware**: Connect your Elliptec rotator via USB
+2. **Identify Port**: Find the serial port name:
+   - Linux: `/dev/ttyUSB0`, `/dev/ttyUSB1`, etc.
+   - Windows: `COM1`, `COM2`, etc.
+   - macOS: `/dev/tty.usbserial-*`
+3. **Set Permissions** (Linux/macOS):
+   ```bash
+   sudo usermod -a -G dialout $USER
+   # Log out and back in
+   ```
 
 ## Logging
 
-This package uses the [Loguru](https://loguru.readthedocs.io/en/stable/) library for logging.
-- The `ElliptecRotator` class no longer uses a `debug` parameter.
-- To see detailed logs (DEBUG, TRACE levels) from the controller, you need to configure Loguru in your application. For example:
-  ```python
-  from loguru import logger
-  import sys
-  logger.add(sys.stderr, level="TRACE") 
-  ```
-- Consult the Loguru documentation for advanced configuration options (e.g., writing to files, custom formats).
+The package uses [Loguru](https://loguru.readthedocs.io/) for comprehensive logging:
+
+```python
+from loguru import logger
+import sys
+
+# Configure logging level
+logger.remove()
+logger.add(sys.stderr, level="DEBUG")  # Options: TRACE, DEBUG, INFO, WARNING, ERROR
+
+# Logging will show detailed communication and device state information
+```
 
 ## Testing
 
-The test suite uses `pytest` and mocks serial communication. To run the tests:
+Run the test suite:
 
-1.  **Install test dependencies:** Make sure `pytest` and `pyserial` are available. If defined in `pyproject.toml` under `[project.optional-dependencies.test]`, you can install them using:
-    ```bash
-    # If using standard pip/venv
-    pip install -e .[test]
+```bash
+# Basic test run
+pytest
 
-    # If using uv
-    uv pip install -e .[test]
-    ```
-    Alternatively, install manually: `pip install pytest pyserial` or `uv pip install pytest pyserial`.
+# With coverage
+pytest --cov=elliptec_controller
 
-2.  **Run pytest:** Navigate to the project root directory (`elliptec-controller`) and run:
-    ```bash
-    pytest tests/
+# Verbose output
+pytest -v
 
-    # Or, if using uv to manage the environment:
-    uv run pytest tests/
-    ```
+# Run specific test
+pytest tests/test_controller.py::TestElliptecRotator::test_basic_movement
+```
+
+## API Documentation
+
+### ElliptecRotator Class
+
+The main class for controlling individual rotators.
+
+#### Initialization
+```python
+ElliptecRotator(port, motor_address, name=None, auto_home=True)
+```
+
+#### Key Methods
+- `home(wait=True)`: Home the rotator
+- `move_absolute(degrees, wait=True)`: Move to absolute position
+- `move_relative(degrees, wait=True)`: Move by relative amount
+- `update_position()`: Get current position
+- `get_status()`: Get device status
+- `set_velocity(velocity)`: Set movement velocity
+- `get_device_info()`: Retrieve device information
+
+#### Group Control Methods
+- `configure_as_group_slave(master_address, offset_degrees)`: Configure for synchronized movement
+- `revert_from_group_slave()`: Return to individual control
+
+## Examples
+
+The `examples/` directory contains comprehensive usage examples:
+
+- `basic_usage.py`: Single rotator control
+- `advanced_usage.py`: Group synchronization and advanced features
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## Development Setup
+
+```bash
+git clone https://github.com/TheFermiSea/elliptec-controller.git
+cd elliptec-controller
+pip install -e .[dev]
+
+# Run tests
+pytest
+
+# Format code
+black elliptec_controller/
+
+# Type checking
+mypy elliptec_controller/
+```
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## Support
+
+- **Issues**: [GitHub Issues](https://github.com/TheFermiSea/elliptec-controller/issues)
+- **Documentation**: [docs/](docs/)
+- **Thorlabs Manual**: [ELLx Protocol Manual](https://www.thorlabs.com/newgrouppage9.cfm?objectgroup_id=9252)
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for version history and changes.

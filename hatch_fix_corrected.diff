@@ -1,8 +1,0 @@
---- a/pyproject.toml
-+++ b/pyproject.toml
-@@ -31,5 +31,5 @@
- testpaths = ["tests"]
- 
- [tool.hatch.build.targets.wheel]
--packages = "elliptec_controller"
-+packages = ["elliptec_controller"]

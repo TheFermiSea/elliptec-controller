@@ -4,49 +4,125 @@ build-backend = "hatchling.build"
 
 [project]
 name = "elliptec-controller"
-version = "0.1.0"
+version = "0.2.0"
 description = "A Python controller for Thorlabs Elliptec rotators"
 authors = [{ name = "Brian Squires", email = "squires.b@gmail.com" }]
 readme = "README.md"
-requires-python = ">=3.6"
+requires-python = ">=3.8"
 license = { file = "LICENSE" }
-dependencies = ["ptpython>=3.0.7", "pyserial>=3.5", "loguru"]
-urls = { repository = "https://github.com/TheFermiSea/elliptec-controller" }
+keywords = ["thorlabs", "elliptec", "rotator", "optical", "automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering",
+    "Topic :: System :: Hardware :: Hardware Drivers",
+]
+dependencies = [
+    "pyserial>=3.5",
+    "loguru>=0.6.0",
+]
 
 [project.optional-dependencies]
-dev = ["pytest>=6.0.0", "pytest-cov>=2.0.0"]
+dev = [
+    "pytest>=6.0.0",
+    "pytest-cov>=2.0.0",
+    "black>=22.0.0",
+    "flake8>=4.0.0",
+    "mypy>=0.900",
+]
+test = [
+    "pytest>=6.0.0",
+    "pytest-cov>=2.0.0",
+]
 
 [project.scripts]
 elliptec-controller = "elliptec_controller.cli:main"
 
-[package]
-name = "elliptec-controller"
-version = "0.1.0"
-
-[tool.black]
-line-length = 100
-target-version = ['py36', 'py37', 'py38', 'py39', 'py310']
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
+[project.urls]
+Homepage = "https://github.com/TheFermiSea/elliptec-controller"
+Repository = "https://github.com/TheFermiSea/elliptec-controller"
+Issues = "https://github.com/TheFermiSea/elliptec-controller/issues"
+Documentation = "https://github.com/TheFermiSea/elliptec-controller/tree/main/docs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["elliptec_controller"]
 
-[tool.pixi.workspace]
-channels = ["conda-forge"]
-platforms = ["linux-64"]
+[tool.hatch.version]
+path = "elliptec_controller/__init__.py"
 
-[tool.pixi.pypi-dependencies]
-elliptec-controller = { path = ".", editable = true }
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
 
-[tool.pixi.environments]
-default = { solve-group = "default" }
-dev = { features = ["dev"], solve-group = "default" }
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+    "--verbose",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+]
 
-[tool.pixi.tasks]
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
 
-[tool.pixi.dependencies]
-pytest = ">=8.3.5,<9"
-loguru = ">=0.7.3,<0.8"
-direnv = ">=2.36.0,<3"
+[tool.coverage.run]
+source = ["elliptec_controller"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]

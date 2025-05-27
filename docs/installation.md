@@ -2,11 +2,14 @@
 
 ## Requirements
 
-- Python 3.6 or later
+- Python 3.8 or later
 - pyserial 3.5 or later
+- loguru 0.6.0 or later
 - A compatible Thorlabs Elliptec rotator device
 
 ## Basic Installation
+
+### From PyPI (Recommended)
 
 Install the package using pip:
 
@@ -14,14 +17,31 @@ Install the package using pip:
 pip install elliptec-controller
 ```
 
-## Development Installation
+### From Source
 
-For development or to get the latest version from GitHub:
+For the latest version from GitHub:
 
 ```bash
 git clone https://github.com/TheFermiSea/elliptec-controller.git
 cd elliptec-controller
+pip install .
+```
+
+## Development Installation
+
+For development work with all tools:
+
+```bash
+git clone https://github.com/TheFermiSea/elliptec-controller.git
+cd elliptec-controller
+pip install -e .[dev]
+```
+
+Or install development requirements separately:
+
+```bash
 pip install -e .
+pip install -r requirements-dev.txt
 ```
 
 ## Hardware Setup
@@ -74,76 +94,115 @@ When using multiple devices:
 2. Use the correct address for each rotator when initializing
 3. Test each device individually before using them together
 
+## Environment Management
+
+### Using Virtual Environments (Recommended)
+
+```bash
+# Create virtual environment
+python -m venv elliptec-env
+source elliptec-env/bin/activate  # Linux/macOS
+# or
+elliptec-env\Scripts\activate     # Windows
+
+# Install package
+pip install elliptec-controller
+```
+
+### Using uv (Modern Alternative)
+
+```bash
+# Install uv if not already installed
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Create and activate environment
+uv venv elliptec-env
+source elliptec-env/bin/activate  # Linux/macOS
+
+# Install package
+uv pip install elliptec-controller
+```
+
 ## Verification
 
-Test your installation:
+Test your installation with this simple script:
 
 ```python
 from elliptec_controller import ElliptecRotator
 from loguru import logger
 import sys
-import serial # For SerialException
+import serial
 
-# Configure Loguru for this example.
-# In a larger application, you might configure this globally.
-logger.remove() # Remove default handler to avoid duplication if already configured
-logger.add(sys.stderr, level="INFO") # Set to "DEBUG" or "TRACE" for more details
+# Configure logging
+logger.remove()
+logger.add(sys.stderr, level="INFO")
 
-# --- Configuration ---
-# IMPORTANT: Replace with your actual serial port and rotator address
-SERIAL_PORT = "/dev/ttyUSB0" 
-MOTOR_ADDRESS = 1 # Example address (0-F)
-# --- End Configuration ---
+# Configuration - REPLACE WITH YOUR VALUES
+SERIAL_PORT = "/dev/ttyUSB0"  # Linux: /dev/ttyUSB0, Windows: COM1, macOS: /dev/tty.usbserial-*
+MOTOR_ADDRESS = 1             # Device address (0-15)
 
-rotator = None
 try:
-    logger.info(f"Attempting to verify connection to rotator at {SERIAL_PORT}, address {MOTOR_ADDRESS}...")
+    logger.info(f"Connecting to rotator at {SERIAL_PORT}, address {MOTOR_ADDRESS}...")
+    
     rotator = ElliptecRotator(
-        port=SERIAL_PORT, 
-        motor_address=MOTOR_ADDRESS, 
-        name=f"Rotator-{MOTOR_ADDRESS}"
-        # auto_home=True is the default, so get_device_info() and home() are attempted during init.
+        port=SERIAL_PORT,
+        motor_address=MOTOR_ADDRESS,
+        name=f"TestRotator-{MOTOR_ADDRESS}",
+        auto_home=False  # Skip auto-homing for quick test
     )
     
-    # Device info is retrieved during initialization by default.
-    # Let's log the stored information.
-    if rotator.device_info and rotator.device_info.get("type") not in ["Unknown", "Error"]:
-        logger.info(f"Successfully connected to {rotator.name}.")
-        logger.info(f"  Device Info: {rotator.device_info}")
-        logger.info(f"  Pulses per Revolution: {rotator.pulse_per_revolution}")
+    # Get device information
+    device_info = rotator.get_device_info()
+    if device_info:
+        logger.info("✅ Connection successful!")
+        logger.info(f"   Device Type: {device_info.get('device_type_hex', 'Unknown')}")
+        logger.info(f"   Serial Number: {device_info.get('serial_number', 'Unknown')}")
+        logger.info(f"   Firmware: {device_info.get('firmware_formatted', 'Unknown')}")
         
-        # Optionally, perform a simple action like getting status
+        # Test basic status query
         status = rotator.get_status()
-        logger.info(f"  Current status code: {status} (00 means OK/Ready)")
+        logger.info(f"   Status: {status} ({'Ready' if status == '00' else 'Busy/Error'})")
         
-        # Example: Get current position (will be 0.0 if homing was successful)
-        position = rotator.update_position()
-        if position is not None:
-            logger.info(f"  Current position: {position:.2f} degrees")
-        else:
-            logger.warning("  Could not retrieve current position after initialization.")
-            
     else:
-        logger.error(f"Failed to get valid device info for {rotator.name} during initialization.")
-        logger.error(f"  Stored device_info: {rotator.device_info}")
-        logger.error("Please check connection, power, and address. Try TRACE level logging for more details.")
-
+        logger.error("❌ Failed to retrieve device information")
+        
 except serial.SerialException as e:
-    logger.error(f"Serial port error during verification: {e}")
-    logger.error(f"Is the port '{SERIAL_PORT}' correct and the device connected & powered?")
+    logger.error(f"❌ Serial port error: {e}")
+    logger.error(f"   Check if port '{SERIAL_PORT}' is correct and device is connected")
 except Exception as e:
-    logger.error(f"Verification failed with an unexpected error: {e}", exc_info=True)
+    logger.error(f"❌ Unexpected error: {e}")
+    
+logger.info("Installation verification complete.")
+```
 
-finally:
-    # The ElliptecRotator class's destructor (__del__) will attempt to close 
-    # the serial port if it was opened by the class (i.e., if a port name string was passed).
-    # If you had passed an already open serial.Serial object to the constructor,
-    # you would be responsible for closing it here.
-    if rotator:
-        logger.info(f"Verification script for {rotator.name} finished.")
-    else:
-        logger.info("Verification script finished (rotator not initialized).")
+## Testing Installation
 
+Run the package's test suite to verify everything works:
+
+```bash
+# Basic test run
+pytest
+
+# With coverage report
+pytest --cov=elliptec_controller
+
+# Verbose output
+pytest -v
+```
+
+## Command Line Interface
+
+After installation, you can use the CLI tool:
+
+```bash
+# Check CLI is working
+elliptec-controller --help
+
+# Test device connection
+elliptec-controller status --port /dev/ttyUSB0 --address 1
+
+# Get device information
+elliptec-controller info --port /dev/ttyUSB0 --address 1
 ```
 
 ## Next Steps
@@ -151,3 +210,4 @@ finally:
 - Read the [Quickstart Guide](quickstart.md)
 - Check the [API Documentation](api.md)
 - Try the [Example Scripts](../examples/)
+- Review [Hardware Setup](hardware.md) for device-specific information

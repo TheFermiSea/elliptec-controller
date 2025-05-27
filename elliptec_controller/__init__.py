@@ -1,13 +1,13 @@
 """
 Elliptec Controller Package
 
-This package provides classes and utilities for controlling Thorlabs Elliptec rotators.
+A Python package for controlling Thorlabs Elliptec rotation stages.
+Provides both individual rotator control and synchronized group movement capabilities.
 """
 
 from .controller import (
     ElliptecRotator,
-    ElliptecGroupController, # Added
-    # TripleRotatorController, # Removed
+    ElliptecGroupController,
     degrees_to_hex,
     hex_to_degrees,
     COMMAND_GET_STATUS,
@@ -16,6 +16,7 @@ from .controller import (
     COMMAND_FORWARD,
     COMMAND_BACKWARD,
     COMMAND_MOVE_ABS,
+    COMMAND_MOVE_REL,
     COMMAND_GET_POS,
     COMMAND_SET_VELOCITY,
     COMMAND_GET_VELOCITY,
@@ -25,14 +26,12 @@ from .controller import (
     COMMAND_GET_JOG_STEP,
     COMMAND_GET_INFO,
     COMMAND_OPTIMIZE_MOTORS,
-    COMMAND_GET_JOG_STEP, # Added
-    COMMAND_GROUP_ADDRESS # Added
+    COMMAND_GROUP_ADDRESS
 )
 
 __all__ = [
     "ElliptecRotator",
-    "ElliptecGroupController", # Added
-    # "TripleRotatorController", # Removed
+    "ElliptecGroupController",
     "degrees_to_hex",
     "hex_to_degrees",
     "COMMAND_GET_STATUS",
@@ -41,6 +40,7 @@ __all__ = [
     "COMMAND_FORWARD",
     "COMMAND_BACKWARD",
     "COMMAND_MOVE_ABS",
+    "COMMAND_MOVE_REL",
     "COMMAND_GET_POS",
     "COMMAND_SET_VELOCITY",
     "COMMAND_GET_VELOCITY",
@@ -50,8 +50,7 @@ __all__ = [
     "COMMAND_GET_JOG_STEP",
     "COMMAND_GET_INFO",
     "COMMAND_OPTIMIZE_MOTORS",
-    "COMMAND_GET_JOG_STEP", # Added
-    "COMMAND_GROUP_ADDRESS", # Added
+    "COMMAND_GROUP_ADDRESS",
 ]
 
-__version__ = '0.1.0'
+__version__ = "0.2.0"
