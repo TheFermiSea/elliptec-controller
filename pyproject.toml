@@ -10,7 +10,7 @@ authors = [{ name = "Brian Squires", email = "squires.b@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.6"
 license = { file = "LICENSE" }
-dependencies = ["ptpython>=3.0.7", "pyserial>=3.5"]
+dependencies = ["ptpython>=3.0.7", "pyserial>=3.5", "loguru"]
 urls = { repository = "https://github.com/TheFermiSea/elliptec-controller" }
 
 [project.optional-dependencies]
@@ -45,3 +45,8 @@ default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 
 [tool.pixi.tasks]
+
+[tool.pixi.dependencies]
+pytest = ">=8.3.5,<9"
+loguru = ">=0.7.3,<0.8"
+direnv = ">=2.36.0,<3"

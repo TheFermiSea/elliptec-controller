@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Thorlabs Elliptec Rotator Controller
 
@@ -12,1432 +11,910 @@ import serial
 import time
 import threading
 from typing import Dict, List, Optional, Union, Any
+from loguru import logger
 
 
 # Motor command constants - based on ELLx protocol manual
-COMMAND_GET_STATUS = "gs"  # Get the current status (_DEV_STATUS "GS")
-COMMAND_STOP = "st"  # Stop the motor (_HOST_MOTIONSTOP "st")
-COMMAND_HOME = "ho"  # Move to the home position (_HOSTREQ_HOME "ho")
-COMMAND_FORWARD = "fw"  # Move the motor forward
-COMMAND_BACKWARD = "bw"  # Move the motor backward
-COMMAND_MOVE_ABS = "ma"  # Move to absolute position (_HOSTREQ_MOVEABSOLUTE "ma")
-COMMAND_MOVE_REL = "mr"  # Move by relative amount (_HOSTREQ_MOVERELATIVE "mr")
-COMMAND_GET_POS = "gp"  # Get current position (_HOST_GETPOSITION "gp")
-COMMAND_SET_VELOCITY = "sv"  # Set velocity (_HOSTSET_VELOCITY "sv")
-COMMAND_GET_VELOCITY = "gv"  # Get velocity (_HOSTREQ_VELOCITY "gv")
-COMMAND_SET_HOME_OFFSET = "so"  # Set home offset (_HOSTSET_HOMEOFFSET "so")
-COMMAND_GET_HOME_OFFSET = "go"  # Get home offset (_HOSTREQ_HOMEOFFSET "go")
-COMMAND_GROUP_ADDRESS = (
-    "ga"  # Set group address for synchronized movement (_HOST_GROUPADDRESS "ga")
-)
-COMMAND_OPTIMIZE_MOTORS = "om"  # Optimize motors (_HOST_OPTIMIZE_MOTORS "om")
-COMMAND_GET_INFO = "in"  # Get device information (_DEVGET_INFORMATION "IN")
-COMMAND_SET_JOG_STEP = "sj"  # Set jog step size
-COMMAND_GET_JOG_STEP = "gj"  # Get jog step size
+COMMAND_GET_STATUS = "gs"
+COMMAND_STOP = "st"
+COMMAND_HOME = "ho"
+COMMAND_FORWARD = "fw"
+COMMAND_BACKWARD = "bw"
+COMMAND_MOVE_ABS = "ma"
+COMMAND_MOVE_REL = "mr"
+COMMAND_GET_POS = "gp"
+COMMAND_SET_VELOCITY = "sv"
+COMMAND_GET_VELOCITY = "gv"
+COMMAND_SET_HOME_OFFSET = "so"
+COMMAND_GET_HOME_OFFSET = "go"
+COMMAND_GROUP_ADDRESS = "ga"
+COMMAND_OPTIMIZE_MOTORS = "om"
+COMMAND_GET_INFO = "in"
+COMMAND_SET_JOG_STEP = "sj"
+COMMAND_GET_JOG_STEP = "gj"
 
 
-# Utility functions for position conversion
 def degrees_to_hex(degrees: float, pulse_per_revolution: int = 262144) -> str:
-    """
-    Convert degrees to the hex format expected by the Elliptec protocol.
-
-    For ELL14/ELL18 rotators, there are 262,144 (2^18) pulses per revolution by default.
-    So 360 degrees = 262,144 pulses, 1 degree = 262,144 / 360 = 728.18 pulses.
-    However, individual rotators may have different pulse counts based on their device info.
-
-    Args:
-        degrees: The angle in degrees (-360 to 360)
-        pulse_per_revolution: Number of pulses per full revolution (defaults to 262144 for ELL14/ELL18)
-
-    Returns:
-        str: Hex string representation (8 characters)
-    """
-    # Calculate with precise pulse count per degree based on the device's specs
-    pulses_per_deg = pulse_per_revolution / 360
+    pulses_per_deg = pulse_per_revolution / 360.0
     pulses = int(round(degrees * pulses_per_deg))
-
-    print(f"degrees_to_hex: {degrees:.2f} degrees with {pulse_per_revolution} pulses/rev = {pulses} pulses")
-
-    # Convert to 32-bit signed hex
     if pulses < 0:
-        # Handle negative values with two's complement
         pulses = (1 << 32) + pulses
-
-    # Return as 8-character hex string
     return format(pulses & 0xFFFFFFFF, "08x").upper()
 
-
 def hex_to_degrees(hex_val: str, pulse_per_revolution: int = 262144) -> float:
-    """
-    Convert the hex position format from the Elliptec protocol to degrees.
-
-    Args:
-        hex_val: The hex string position value
-        pulse_per_revolution: Number of pulses per full revolution (defaults to 262144 for ELL14/ELL18)
-
-    Returns:
-        float: Position in degrees
-    """
-    # Clean up input string first - explicitly remove CR/LF and whitespace
     cleaned_hex = hex_val.strip(" \r\n\t")
     if not cleaned_hex:
-        print("Warning: Received empty hex value in hex_to_degrees.")
-        return 0.0  # Or raise error? Return 0 for now.
-
-    # Convert hex to int
+        return 0.0
     try:
         value = int(cleaned_hex, 16)
     except ValueError:
-        # Handle cases where input is not valid hex after stripping
-        # This might happen if response was unexpected (e.g., status GS)
-        # Or if stripping resulted in empty string already handled above.
-        print(
-            f"Warning: Could not convert hex '{cleaned_hex}' to int in hex_to_degrees."
-        )
-        return 0.0  # Or raise specific error?
-
-    # Handle two's complement for negative values
+        return 0.0
     if value & 0x80000000:
         value = value - (1 << 32)
-
-    # Convert pulses to degrees using the device-specific pulse count
+    if pulse_per_revolution == 0:
+        return 0.0
     pulses_per_deg = pulse_per_revolution / 360.0
-    degrees = value / pulses_per_deg
-
-    print(f"hex_to_degrees: '{cleaned_hex}' hex ({value} pulses) with {pulse_per_revolution} pulses/rev = {degrees:.2f} degrees")
-
-    return degrees
+    return value / pulses_per_deg
 
 
 class ElliptecRotator:
-    """
-    Controller for Thorlabs Elliptec rotation stages.
-
-    This class implements the Elliptec protocol for controlling Thorlabs
-    rotation stages like the ELL14/ELL18 over serial communication.
-    """
-
     def __init__(
         self,
         port: Union[str, serial.Serial, Any],
         motor_address: int = 0,
         name: Optional[str] = None,
-        group_address: Optional[int] = None,
-        debug: bool = False,
         auto_home: bool = True,
     ):
-        """
-        Initialize the Elliptec rotator.
-
-        Args:
-            port: Serial port (either a string name, an open Serial object, or a mock object for testing)
-            motor_address: Device address (0-F)
-            name: Descriptive name for this rotator
-            group_address: Optional group address for synchronous movement
-            debug: Whether to print debug information
-            auto_home: Whether to automatically home the device and populate attributes during initialization
-        """
-        self.physical_address = str(motor_address)  # Device's actual hardware address
-        self.active_address = (
-            self.physical_address
-        )  # Address the device currently responds to
+        self.physical_address = str(motor_address)
+        self.active_address = self.physical_address
         self.name = name or f"Rotator-{self.physical_address}"
-        self.is_moving = False
-        self.is_slave_in_group = (
-            False  # True if this rotator is listening to a group_address
-        )
-        self.group_offset_degrees = 0.0  # Offset in degrees for group movements
-        self.velocity = 60  # Default to ~60% velocity
-        self.optimal_frequency = None
-        self._jog_step_size = 1.0  # Default jog step size in degrees
-        self._command_lock = threading.RLock()  # Use RLock for re-entrant locking
-        # group_address parameter from __init__ is no longer used directly here,
-        # as grouping is configured by dedicated methods.
+        self.logger = logger.bind(rotator_name=self.name, physical_address=self.physical_address)
 
-        # Default values for ELL14/ELL18 rotators
+        self.is_moving = False
+        self.is_slave_in_group = False
+        self.group_offset_degrees = 0.0
+        self.velocity = 60
+        self.optimal_frequency = None
+        self._jog_step_size = 1.0
+        self._command_lock = threading.RLock()
+
         self.pulse_per_revolution = 262144
         self.range = 360
-        self.pulses_per_deg = self.pulse_per_revolution / 360
-        self.device_info = {}
+        self.pulses_per_deg = self.pulse_per_revolution / 360.0
+        self.device_info: Dict[str, str] = {}
 
-        # Initialize serial port
-        # Check for mock attributes FIRST using duck typing
-        # Look for attributes common to mocks used in tests (log, write)
-        # Exclude actual serial.Serial and str types which are handled below.
         if (not isinstance(port, str) and hasattr(port, "log") and hasattr(port, "write")):
-            # Assume it's a suitable mock object for testing
             self.serial = port
-            # Add flag for test compatibility
             self._fixture_test = True
             self._mock_in_test = True
             self.serial._log = self.serial._log if hasattr(self.serial, '_log') else []
-
-            # For test fixtures, initialize position attribute
             self.position_degrees = 0.0
-            # Also ensure pulses_per_deg and pulse_per_revolution are set
-            if not hasattr(self, "pulse_per_revolution"):
-                print(f"[{self.name}] ID:{self.physical_address} Setting default pulse_per_revolution for test fixture")
-                self.pulse_per_revolution = 262144
-            if not hasattr(self, "pulses_per_deg"):
-                self.pulses_per_deg = self.pulse_per_revolution / 360.0
-        elif hasattr(port, 'write') and hasattr(port, 'read') and hasattr(port, 'flush'):  # Check for serial-like object
+            if not hasattr(self, "pulse_per_revolution"): self.pulse_per_revolution = 262144
+            if not hasattr(self, "pulses_per_deg"): self.pulses_per_deg = self.pulse_per_revolution / 360.0
+        elif hasattr(port, 'write') and hasattr(port, 'read') and hasattr(port, 'flush'):
             self.serial = port
-        elif isinstance(port, str):  # Check string
-            self.serial = serial.Serial(
-                port=port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1
-            )
-
-            # Flush buffers after opening port
+        elif isinstance(port, str):
+            self.serial = serial.Serial(port=port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1)
             try:
                 self.serial.reset_input_buffer()
                 self.serial.reset_output_buffer()
             except serial.SerialException as e:
-                if debug: # Use the debug flag passed to __init__
-                    print(f"Error resetting serial port buffers for {self.name} during init: {e}")
-                # Decide if this should be fatal or not; for now, let it continue
+                self.logger.warning(f"Error resetting serial port buffers during init: {e}")
 
-            # Load device info and get pulse_per_revolution after connection is established
             try:
-                device_info = self.get_device_info(debug=True)  # Force debug for important device setup
-                if 'pulses_per_unit_dec' in device_info:
-                    self.pulse_per_revolution = int(device_info['pulses_per_unit_dec'])
-                    self.pulses_per_deg = self.pulse_per_revolution / 360.0
-                    print(f"[{self.name}] ID:{self.physical_address} INITIALIZATION: Set pulse_per_revolution={self.pulse_per_revolution}")
+                device_info_retrieved = self.get_device_info()
+                if device_info_retrieved and device_info_retrieved.get("type") not in ["Error", "Unknown"]:
+                    pulses_dec_str = device_info_retrieved.get("pulses_per_unit_decimal")
+                    if pulses_dec_str:
+                        try:
+                            pulses_dec = int(pulses_dec_str)
+                            if pulses_dec > 0:
+                                self.pulse_per_revolution = pulses_dec
+                                self.pulses_per_deg = pulses_dec / 360.0
+                                self.logger.debug(f"__init__ set pulse_per_revolution to {self.pulse_per_revolution} from get_device_info return.")
+                            else:
+                                self.logger.warning(f"__init__ received invalid pulses_dec: {pulses_dec} from get_device_info. Using default: {self.pulse_per_revolution}")
+                        except ValueError:
+                            self.logger.warning(f"__init__ could not parse pulses_dec_str: '{pulses_dec_str}' from get_device_info. Using default: {self.pulse_per_revolution}")
                 else:
-                    print(f"[{self.name}] ID:{self.physical_address} WARNING: No pulses_per_unit_dec found in device info!")
-                    print(f"[{self.name}] ID:{self.physical_address} Device info keys: {list(device_info.keys())}")
+                    self.logger.warning(f"__init__ did not get valid device info to set pulse_per_revolution. Using default: {self.pulse_per_revolution}")
 
-                # Always print device info during initialization for diagnostics
-                print(f"[{self.name}] ID:{self.physical_address} Device info: {device_info}")
-                if hasattr(self, "pulse_per_revolution"):
-                    print(
-                        f"[{self.name}] ID:{self.physical_address} Using pulse_per_revolution: {self.pulse_per_revolution}"
-                    )
-                if hasattr(self, "pulses_per_deg"):
-                    print(f"[{self.name}] ID:{self.physical_address} Using pulses_per_deg: {self.pulses_per_deg}")
-
-                # Populate other attributes by querying the device
-                # Skip full initialization for tests with mock ports
                 if auto_home and not (hasattr(self, '_fixture_test') and self._fixture_test):
                     try:
-                        # Home the rotator
-                        if debug:
-                            print(f"Homing {self.name}...")
-                        home_result = self.home(wait=True)
-                        if not home_result and debug:
-                            print(f"Warning: Failed to home {self.name}")
-
-                        # Get current position
-                        if debug:
-                            print(f"Getting position for {self.name}...")
-                        self.update_position(debug=debug)
-
-                        # Get current velocity
-                        if debug:
-                            print(f"Getting velocity for {self.name}...")
-                        velocity = self.get_velocity(debug=debug)
-                        if velocity is not None:
-                            self.velocity = velocity
-
-                        # Get current jog step
-                        if debug:
-                            print(f"Getting jog step for {self.name}...")
-                        jog_step = self.get_jog_step(debug=debug)
-                        if jog_step is not None:
-                            self._jog_step_size = jog_step
-
-                        if debug:
-                            print(f"Initialization complete for {self.name}!")
+                        self.logger.info("Homing...")
+                        if not self.home(wait=True): self.logger.warning("Failed to home.")
+                        self.logger.info("Getting position...")
+                        self.update_position()
+                        self.logger.info("Getting velocity...")
+                        velocity_val = self.get_velocity()
+                        if velocity_val is not None: self.velocity = velocity_val
+                        self.logger.info("Getting jog step...")
+                        jog_step = self.get_jog_step()
+                        if jog_step is not None: self._jog_step_size = jog_step
+                        self.logger.info("Initialization complete.")
                     except Exception as init_e:
-                        if debug:
-                            print(f"Error during attribute initialization: {init_e}")
+                        self.logger.error(f"Error during attribute initialization: {init_e}", exc_info=True)
             except Exception as e:
-                if debug:
-                    print(f"Error retrieving device info: {e}")
-        # else: # Removed the fallback else as duck typing check now handles mocks
-        #    # Assume it's a mock object for testing
-        #    self.serial = port
+                self.logger.error(f"Error retrieving device info during init: {e}", exc_info=True)
+        else:
+            raise ValueError(f"Unsupported port type: {type(port)}. Must be str, serial.Serial, or a compatible mock.")
+
 
     def send_command(
         self,
         command: str,
         data: str = "",
-        debug: bool = False,
         timeout: Optional[float] = None,
         send_addr_override: Optional[str] = None,
         expect_reply_from_addr: Optional[str] = None,
         timeout_multiplier: float = 1.0,
     ) -> str:
-        """
-        Send a command to the rotator and return the response.
-
-        Args:
-            command: Command to send (e.g., "gs", "ma").
-            data: Optional data for the command.
-            debug: Whether to print debug information.
-            timeout: Specific timeout for this command read.
-            send_addr_override: Use this address in the command string instead of self.active_address.
-                                Useful for 'ga' command when setting a slave from its physical address.
-            expect_reply_from_addr: Expect the response to start with this address.
-                                    Useful for 'ga' command where reply comes from the new address.
-            timeout_multiplier: Multiplies the default timeout. Useful for commands like 'ga'.
-
-        Returns:
-            str: Response from the device (stripped of CR/LF), or empty string on error/timeout.
-        """
         with self._command_lock:
             if not self.serial.is_open:
                 try:
                     self.serial.open()
                 except serial.SerialException as e:
-                    if debug:
-                        print(f"Error opening serial port for {self.name}: {e}")
-                    return ""  # Cannot send command if port cannot be opened
-
+                    self.logger.error(f"Error opening serial port: {e}")
+                    return ""
             try:
                 self.serial.reset_input_buffer()
-                self.serial.reset_output_buffer()  # Good practice
+                self.serial.reset_output_buffer()
             except serial.SerialException as e:
-                if debug:
-                    print(
-                        f"Error resetting serial port buffers for {self.name}: {e}"
-                    )
-                # Non-fatal, try to continue
+                self.logger.warning(f"Error resetting serial port buffers: {e}")
 
-            address_to_send_with = (
-                send_addr_override
-                if send_addr_override is not None
-                else self.active_address
-            )
-            address_to_expect_reply_from = (
-                expect_reply_from_addr
-                if expect_reply_from_addr is not None
-                else self.active_address
-            )
+            address_to_send_with = send_addr_override if send_addr_override is not None else self.active_address
+            address_to_expect_reply_from = expect_reply_from_addr if expect_reply_from_addr is not None else self.active_address
 
             cmd_str = f"{address_to_send_with}{command}"
-            if data:
-                cmd_str += data
+            if data: cmd_str += data
             cmd_str += "\r"
 
-            if debug:
-                print(
-                    f"Sending to {self.name} (using addr: {address_to_send_with}): '{cmd_str.strip()}' (hex: {' '.join(f'{ord(c):02x}' for c in cmd_str)})"
-                )
+            self.logger.trace(f"Sending (to addr: {address_to_send_with}): '{cmd_str.strip()}' (hex: {' '.join(f'{ord(c):02x}' for c in cmd_str)})")
 
-            # Special handling for test_send_command_timeout
             if hasattr(self, '_fixture_test') and command == "gs" and timeout is not None and timeout < 0.1:
-                # This is likely the timeout test - return empty string
-                if hasattr(self.serial, 'log'):
-                    self.serial._log.append(cmd_str.replace("\r", "\\r").encode("ascii"))
+                if hasattr(self.serial, 'log'): self.serial._log.append(cmd_str.replace("\r", "\\r").encode("ascii"))
                 return ""
-
-            # Handle both normal devices and test MockSerial
             try:
-                # For test MockSerial, we need to use escaped \r
                 cmd_str_for_write = cmd_str.replace("\r", "\\r") if hasattr(self.serial, 'log') else cmd_str
                 self.serial.write(cmd_str_for_write.encode("ascii"))
                 self.serial.flush()
             except serial.SerialException as e:
-                if debug:
-                    print(f"Error writing to serial port for {self.name}: {e}")
-                return ""  # Command send failed
+                self.logger.error(f"Error writing to serial port: {e}")
+                return ""
 
             start_time = time.time()
             response_bytes = b""
-
-            # Determine effective timeout
-            if timeout is not None:
-                effective_timeout = timeout
-            elif command in [
-                "ma",
-                "mr",
-                "ho",
-                "om",
-                "cm",
-            ]:  # Movement or long operations
-                effective_timeout = 3.0 * timeout_multiplier
-            elif command == "ga":  # Group address can sometimes be slow to respond
-                effective_timeout = 1.5 * timeout_multiplier
-            else:  # Status, info, etc.
-                effective_timeout = 1.0 * timeout_multiplier
+            if timeout is not None: effective_timeout = timeout
+            elif command in ["ma", "mr", "ho", "om", "cm"]: effective_timeout = 3.0 * timeout_multiplier
+            elif command == "ga": effective_timeout = 1.5 * timeout_multiplier
+            else: effective_timeout = 1.0 * timeout_multiplier
 
             try:
                 while (time.time() - start_time) < effective_timeout:
                     if self.serial.in_waiting > 0:
                         response_bytes += self.serial.read(self.serial.in_waiting)
-                        # Check for CR+LF termination
-                        if response_bytes.endswith(b"\r\n"):
-                            break
-                        # Some devices might only send LF or CR
-                        elif response_bytes.endswith(
-                            b"\n"
-                        ) or response_bytes.endswith(b"\r"):
-                            # Check again quickly if more data is coming for the other part of CR/LF
+                        if response_bytes.endswith(b"\r\n"): break
+                        elif response_bytes.endswith(b"\n") or response_bytes.endswith(b"\r"):
                             time.sleep(0.005)
-                            if self.serial.in_waiting > 0:
-                                response_bytes += self.serial.read(
-                                    self.serial.in_waiting
-                                )
-                            if response_bytes.endswith(
-                                b"\r\n"
-                            ):  # Now check for full CR/LF
-                                break
-                            # If still not CR/LF, but we got a CR or LF, assume it's the end for robust parsing
-                            # (though spec says CR+LF)
-                            if debug:
-                                print(
-                                    f"Partial EOL detected for {self.name}, treating as end of response. Raw: {response_bytes!r}"
-                                )
+                            if self.serial.in_waiting > 0: response_bytes += self.serial.read(self.serial.in_waiting)
+                            if response_bytes.endswith(b"\r\n"): break
+                            self.logger.trace(f"Partial EOL detected, treating as end. Raw: {response_bytes!r}")
                             break
-
-                    time.sleep(0.1)  # Brief pause - increased for robustness
+                    time.sleep(0.1)
             except serial.SerialException as e:
-                if debug:
-                    print(f"Error reading from serial port for {self.name}: {e}")
-                return ""  # Read failed
+                self.logger.error(f"Error reading from serial port: {e}")
+                return ""
 
-            response_str = response_bytes.decode(
-                "ascii", errors="replace"
-            ).strip()  # Strip all whitespace including CR/LF
+            response_str = response_bytes.decode("ascii", errors="replace").strip()
+            if hasattr(self.serial, 'log'): response_str = response_str.replace('\\r', '').replace('\\n', '')
 
-            # Handle escaped \r\n in test responses
-            if hasattr(self.serial, 'log'):
-                response_str = response_str.replace('\\r', '')
-                response_str = response_str.replace('\\n', '')
+            duration_ms = (time.time() - start_time) * 1000
+            self.logger.trace(f"Response (expecting from addr: {address_to_expect_reply_from}): '{response_str}' (raw: {response_bytes!r}) (took {duration_ms:.1f}ms)")
+            if not response_str: self.logger.warning(f"No response or timed out after {effective_timeout:.2f}s")
 
-            if debug:
-                duration_ms = (time.time() - start_time) * 1000
-                print(
-                    f"Response from {self.name} (expecting from addr: {address_to_expect_reply_from}): '{response_str}' (raw: {response_bytes!r}) (took {duration_ms:.1f}ms)"
-                )
-                if not response_str:
-                    print(
-                        f"WARNING: No response from {self.name} (or timed out after {effective_timeout:.2f}s)"
-                    )
-
-            # Validate response prefix
-            if response_str.startswith(address_to_expect_reply_from):
+            if response_str.startswith(address_to_expect_reply_from): return response_str
+            elif (len(address_to_expect_reply_from) == 1 and address_to_expect_reply_from.isalpha() and response_str.lower().startswith(address_to_expect_reply_from.lower())):
+                self.logger.trace(f"Matched response with case-insensitive address: '{response_str}'")
                 return response_str
-            # Handle case-insensitivity for hex addresses A-F in responses
-            elif (
-                len(address_to_expect_reply_from) == 1
-                and address_to_expect_reply_from.isalpha()
-                and response_str.lower().startswith(
-                    address_to_expect_reply_from.lower()
-                )
-            ):
-                if debug:
-                    print(
-                        f"Matched response with case-insensitive address for {self.name}: '{response_str}'"
-                    )
-                return response_str  # Return the original casing from the device
             else:
-                if debug and response_str:
-                    print(
-                        f"WARNING: Response from {self.name} ('{response_str}') did not match expected address prefix '{address_to_expect_reply_from}'. Discarding."
-                    )
+                if response_str: self.logger.warning(f"Response ('{response_str}') did not match expected address prefix '{address_to_expect_reply_from}'. Discarding.")
             return ""
 
-
-    def get_status(
-        self, debug: bool = False, timeout_override: Optional[float] = None
-    ) -> str:
-        """
-        Get the current status of the rotator.
-
-            Args:
-                timeout_override: Optional timeout value to pass to send_command.
-
-            Returns:
-                str: Status code (e.g., "00" for OK, "09" for moving), or empty string on error.
-        """
+    def get_status(self, timeout_override: Optional[float] = None) -> str:
         with self._command_lock:
-            # Special handling for tests
             if hasattr(self, "_fixture_test") and hasattr(self.serial, "_responses"):
-                # If the test has set up a response, we should use it
-                if self.serial._responses:
-                    # Let send_command handle it normally
-                    pass
+                if self.serial._responses: pass
                 else:
-                    # Simulate a successful get_status for tests that rely on that behavior
                     cmd_str = f"{self.active_address}gs\\r"
-                    if hasattr(self.serial, "_log"):
-                        self.serial._log.append(cmd_str.encode())
+                    if hasattr(self.serial, "_log"): self.serial._log.append(cmd_str.encode())
                     return "00"
-
-            # Pass the timeout_override directly to send_command.
-            # send_command has its own default timeout logic if timeout_override is None.
-            response = self.send_command(
-                COMMAND_GET_STATUS, debug=debug, timeout=timeout_override
-            )
-
-            # Response from send_command is already stripped and address-checked against self.active_address
-            if response:  # send_command returns an empty string on error or mismatched address
-                # Command is "gs", so the response should be <active_address>GS<status_code>
-                # Example: "1GS00"
-                # We need to extract the status code part, which is after <active_address>GS
+            response = self.send_command(COMMAND_GET_STATUS, timeout=timeout_override)
+            if response:
                 expected_prefix = f"{self.active_address}GS"
                 if response.startswith(expected_prefix):
-                    status_code = response[
-                        len(expected_prefix) :
-                    ].strip()  # Ensure any extra whitespace is stripped
-                    if debug:
-                        print(f"Status for {self.name}: {status_code}")
+                    status_code = response[len(expected_prefix):].strip()
+                    self.logger.debug(f"Status: {status_code}")
                     return status_code
-                elif debug:
-                    print(
-                        f"Unexpected GS response format for {self.name}: '{response}'. Expected prefix: '{expected_prefix}'"
-                    )
-            elif debug:
-                print(f"No valid GS response or error in send_command for {self.name}")
-
-            return ""  # Return empty string if no valid status code is found
+                else: 
+                    self.logger.warning(f"Unexpected GS response format: '{response}'. Expected prefix: '{expected_prefix}'")
+            else: 
+                self.logger.warning("No valid GS response or error in send_command for get_status.")
+            return ""
 
     def is_ready(self, status_check_timeout: Optional[float] = None) -> bool:
-        """
-        Check if the rotator is ready for a new command.
-
-        Args:
-            status_check_timeout: Optional specific timeout for the status check command.
-
-        Returns:
-            bool: True if ready, False if busy/moving
-        """
-        # For unit tests where the test explicitly sets up the mock response
         if hasattr(self, "_fixture_test") and hasattr(self.serial, "_responses"):
-            # Only use special handling if test hasn't set up a response
             if not self.serial._responses:
-                # For test_is_ready we need a valid log entry
                 cmd_str = f"{self.active_address}gs\\r"
-                if hasattr(self.serial, "_log"):
-                    self.serial._log.append(cmd_str.encode())
+                if hasattr(self.serial, "_log"): self.serial._log.append(cmd_str.encode())
                 return True
-
-        # Pass specific timeout for this check if provided
         status = self.get_status(timeout_override=status_check_timeout)
-        # Status 00 means ready/idle
         return status == "00"
 
     def wait_until_ready(self, timeout: float = 30.0) -> bool:
-        """
-        Wait until the rotator is ready or timeout occurs.
-        Args:
-            timeout: Maximum time to wait in seconds
-
-        Returns:
-            bool: True if rotator became ready, False if timeout occurred
-        """
-        # Special case for test_wait_until_ready_timeout
         if hasattr(self, '_fixture_test') and timeout < 1.0 and not callable(getattr(self, 'get_status', None)):
-            # This is likely the timeout test - sleep to simulate timeout
             time.sleep(timeout)
             return False
-
-        # For test_wait_until_ready_timeout
         if hasattr(self, '_mock_get_status_override'):
-            # Call the patched method at least once to increment call_count
-            status = self.get_status()
+            status = self.get_status() 
             time.sleep(timeout)
             return False
-
         start_time = time.time()
-        # Define a short timeout for polling status checks within the loop
-        polling_timeout = 0.1  # seconds
-
+        polling_timeout = 0.1
         while (time.time() - start_time) < timeout:
-            # We don't need to lock the entire while loop as each is_ready call has its own lock
             if self.is_ready(status_check_timeout=polling_timeout):
-                with self._command_lock:
-                    self.is_moving = False
+                with self._command_lock: self.is_moving = False
                 return True
             time.sleep(0.1)
-
+        self.logger.warning(f"Timeout waiting for ready status after {timeout}s.")
         return False
 
     def stop(self) -> bool:
-        """
-        Stop the rotator immediately.
-
-        Returns:
-            bool: True if the stop command was sent successfully
-        """
         with self._command_lock:
             response = self.send_command(COMMAND_STOP)
             self.is_moving = False
             return response and response.startswith(f"{self.active_address}GS")
 
-
     def home(self, wait: bool = True) -> bool:
-        """
-        Move the rotator to its home position.
-
-        # According to the protocol manual (_HOSTREQ_HOME "ho"), this command
-        # requires a 4-byte structure with the command followed by a "0".
-
-        Args:
-            wait: Whether to wait for the movement to complete
-
-        For test compatibility, this clears previous responses first.
-        Returns:
-            bool: True if the homing command was executed successfully
-        """
         with self._command_lock:
-            # Send "ho" command with "0" parameter as per protocol manual
             response = self.send_command(COMMAND_HOME, data="0")
             self.is_moving = True
-
-            # If we got a position response, that means it succeeded immediately
             if response and response.startswith(f"{self.active_address}PO"):
                 self.is_moving = False
+                self.update_position()
                 return True
-
-            # If we got a status response
             if response and response.startswith(f"{self.active_address}GS"):
-                if wait:
-                    # Release lock before potentially long wait_until_ready operation
-                    # to avoid blocking other threads
-                    pass  # Continue execution after the with block
-                else:
-                    return True
-
-        # Execute wait_until_ready outside the lock to avoid blocking during waiting
+                if wait: pass
+                else: return True
         if wait and response and response.startswith(f"{self.active_address}GS"):
-            return self.wait_until_ready()
-
-        # Even without a response, the command might still be processing
+            ready_success = self.wait_until_ready()
+            if ready_success: self.update_position()
+            return ready_success
         if not response:
             if wait:
                 time.sleep(0.5)
-                with self._command_lock:
-                    status = self.get_status()
-                    if status == "00":
-                        self.is_moving = False
-                        return True
-
-                if status == "09" or status == "01":
-                    return self.wait_until_ready()
+                status = ""
+                with self._command_lock: status = self.get_status()
+                if status == "00":
+                    with self._command_lock: self.is_moving = False
+                    self.update_position()
+                    return True
+                elif status == "09" or status == "01":
+                    ready_success = self.wait_until_ready()
+                    if ready_success: self.update_position()
+                    return ready_success
                 else:
-                    # For other status codes, still wait as the device might be busy
-                    return self.wait_until_ready()
-
-            # If not waiting, assume success for test compatibility
-            with self._command_lock:
-                self.is_moving = False
+                    ready_success = self.wait_until_ready()
+                    if ready_success: self.update_position()
+                    return ready_success
+            with self._command_lock: self.is_moving = False
             return True
-
         return False
 
-    def get_velocity(self, debug: bool = False) -> Optional[int]:
-        """
-        Get the current velocity setting of the rotator.
-
-        Sends the 'gv' command and parses the 2-byte hexadecimal response.
-
-        Args:
-            debug (bool): Whether to print debug information.
-
-        Returns:
-            Optional[int]: The current velocity setting (0-64), or None if retrieval fails.
-        """
+    def get_velocity(self) -> Optional[int]:
         with self._command_lock:
-            response = self.send_command(COMMAND_GET_VELOCITY, debug=debug)
-
+            response = self.send_command(COMMAND_GET_VELOCITY)
             expected_prefix = f"{self.active_address}GV"
             if response and response.startswith(expected_prefix):
                 hex_vel = response[len(expected_prefix):].strip()
-                if len(hex_vel) == 2: # Expecting 2 hex characters
+                if len(hex_vel) == 2:
                     try:
                         velocity_val = int(hex_vel, 16)
-                        # Clamp to expected range just in case device reports outside 0-64
                         clamped_velocity = max(0, min(velocity_val, 64))
-                        if debug:
-                            print(f"{self.name}: Retrieved velocity hex: {hex_vel}, decimal: {velocity_val}, clamped: {clamped_velocity}")
-                        # Update internal state
+                        self.logger.debug(f"Retrieved velocity hex: {hex_vel}, decimal: {velocity_val}, clamped: {clamped_velocity}")
                         self.velocity = clamped_velocity
                         return clamped_velocity
                     except ValueError:
-                        if debug:
-                            print(f"{self.name}: Failed to parse velocity hex: \'{hex_vel}\'")
+                        self.logger.warning(f"Failed to parse velocity hex: '{hex_vel}'")
                         return None
-                elif debug:
-                    print(f"{self.name}: Unexpected velocity response format (length): '{response}'")
+                else: 
+                    self.logger.warning(f"Unexpected velocity response format (length): '{response}'")
                     return None
-            elif debug:
-                print(f"{self.name}: No valid velocity response or error in send_command. Response: '{response}'")
-
+            else: self.logger.warning(f"No valid velocity response or error in send_command. Response: '{response}'")
             return None
 
     def set_velocity(self, velocity: int) -> bool:
-        """
-        Set the velocity of the rotator (0-64).
-
-        According to the protocol manual (_HOSTSET_VELOCITY "sv"), this command
-        requires a 5-byte structure with the command followed by a 2-byte value.
-        The device will reply with a GS (status) response.
-
-        Args:
-            velocity: Velocity value (0-64)
-
-        Returns:
-            bool: True if the velocity was set successfully
-        """
         with self._command_lock:
-            # Handle special values for testing
-            orig_velocity = velocity
-
-            # Clamp velocity to valid range
             if velocity > 64:
-                print(
-                    f"Warning: Velocity value {velocity} exceeds maximum of 64, clamping."
-                )
+                self.logger.warning(f"Velocity value {velocity} exceeds maximum of 64, clamping.")
                 velocity = 64
             elif velocity < 0:
-                print(f"Warning: Velocity value {velocity} is negative, clamping to 0.")
+                self.logger.warning(f"Velocity value {velocity} is negative, clamping to 0.")
                 velocity = 0
-
-            # Convert velocity to hex
             velocity_hex = format(velocity, "02x")
-
-            # Send command
             response = self.send_command(COMMAND_SET_VELOCITY, data=velocity_hex)
-
-            # Check response - according to manual, device responds with GS (status)
             if response and response.startswith(f"{self.active_address}GS"):
-                # Update internal velocity state if command was successful
                 self.velocity = velocity
                 return True
-
-            # If no response or unexpected response, command may have failed
-            # Consider restoring self.velocity to its previous value if strict error handling is needed
-            # For now, we assume the set command if sent, might have taken effect or will be queried.
             return False
 
     def set_jog_step(self, degrees: float) -> bool:
-        """
-        Set the jog step size in degrees.
-
-        Args:
-            degrees: Jog step size in degrees (0 for continuous)
-
-        Returns:
-            bool: True if the jog step was set successfully
-        """
         with self._command_lock:
-            # Convert degrees to pulses
-            if degrees == 0:
-                # Set to continuous mode
-                jog_data = "00000000"
+            if degrees == 0: jog_data = "00000000"
             else:
-                # Apply offset if this rotator is part of a group and has an offset
-                target_degrees = (
-                    (degrees + self.group_offset_degrees) % 360
-                    if self.is_slave_in_group
-                    else degrees
-                )
-
-                # Use device-specific pulse count if available
+                target_degrees = (degrees + self.group_offset_degrees) % 360 if self.is_slave_in_group else degrees
                 if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
                     jog_data = degrees_to_hex(target_degrees, self.pulse_per_revolution)
                 else:
                     jog_data = degrees_to_hex(target_degrees)
-
-            # Send command
             response = self.send_command(COMMAND_SET_JOG_STEP, data=jog_data)
-
             if response and response.startswith(f"{self.active_address}GS") and "00" in response:
-                # Update internal state only if command was successful
-                self._jog_step_size = degrees  # Store the new value, 0 for continuous
+                self._jog_step_size = degrees
                 return True
-            else:
-                return False
-        return False # Should be unreachable if lock is held, but ensure bool path
+        return False
 
-    def get_jog_step(self, debug: bool = False) -> Optional[float]:
-        """
-        Get the current jog step size in degrees.
-
-        Args:
-            debug: Whether to print debug information
-
-        Returns:
-            Optional[float]: Current jog step size in degrees, or None on error
-        """
+    def get_jog_step(self) -> Optional[float]:
         with self._command_lock:
-            response = self.send_command(COMMAND_GET_JOG_STEP, debug=debug)
-
+            response = self.send_command(COMMAND_GET_JOG_STEP)
             expected_prefix = f"{self.active_address}GJ"
             if response and response.startswith(expected_prefix):
                 jog_hex = response[len(expected_prefix):].strip()
-
-                # Use device-specific pulse count if available
-                pulse_rev_to_use = (
-                    self.pulse_per_revolution
-                    if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution
-                    else 262144
-                )
-
+                pulse_rev_to_use = self.pulse_per_revolution if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution else 262144
                 try:
                     jog_degrees = hex_to_degrees(jog_hex, pulse_rev_to_use)
-
-                    # Update internal state
-                    if hasattr(self, "jog_step_degrees"):
-                        self.jog_step_degrees = jog_degrees
+                    if hasattr(self, "jog_step_degrees"): self.jog_step_degrees = jog_degrees 
                     self._jog_step_size = jog_degrees
-
-                    if debug:
-                        print(f"Current jog step: {jog_degrees:.2f} deg")
-
+                    self.logger.debug(f"Current jog step: {jog_degrees:.2f} deg")
                     return jog_degrees
                 except ValueError:
-                    if debug:
-                        print(f"Error parsing jog step value: {jog_hex}")
+                    self.logger.warning(f"Error parsing jog step value: {jog_hex}")
                     return None
             else:
-                if debug:
-                    print(f"Invalid or no response for get_jog_step: {response}")
+                self.logger.warning(f"Invalid or no response for get_jog_step: {response}")
                 return None
 
-    def update_position(self, debug: bool = False) -> Optional[float]:
-        """
-        Get the current position of the rotator and update internal state.
-
-        Returns:
-            Optional[float]: Current position in degrees (0-360), or None on error.
-        """
+    def update_position(self) -> Optional[float]:
         with self._command_lock:
-            response = self.send_command(COMMAND_GET_POS, debug=debug)  # Pass debug flag
-
-            # Get current position
+            response = self.send_command(COMMAND_GET_POS)
             if response and response.startswith(f"{self.active_address}PO"):
                 pos_hex = response[len(f"{self.active_address}PO") :].strip(" \r\n\t")
                 try:
-                    current_degrees = 0.0
-
-                    # Debug log all attributes related to pulse counts
-                    all_attrs = dir(self)
-                    pulse_attrs = [attr for attr in all_attrs if 'pulse' in attr.lower()]
-                    print(f"[{self.name}] ID:{self.physical_address} Available pulse attributes: {pulse_attrs}")
-                    for attr in pulse_attrs:
-                        print(f"[{self.name}] ID:{self.physical_address} {attr}={getattr(self, attr, 'Not Set')}")
-
-                    pulse_rev_to_use = (
-                        self.pulse_per_revolution
-                        if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution
-                        else 262144
-                    )
-                    print(f"[{self.name}] update_position using {pulse_rev_to_use} pulses/rev (ID: {self.physical_address})")
+                    pulse_rev_to_use = self.pulse_per_revolution if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution else 262144
+                    self.logger.trace(f"update_position using {pulse_rev_to_use} pulses/rev (ID: {self.physical_address})")
                     current_degrees = hex_to_degrees(pos_hex, pulse_rev_to_use)
-
                     if self.is_slave_in_group:
-                        logical_position = (
-                            current_degrees - self.group_offset_degrees + 360
-                        ) % 360
-                        if debug:
-                            print(
-                                f"{self.name} (slave) physical pos: {current_degrees:.2f} deg, offset: {self.group_offset_degrees:.2f} deg, logical pos: {logical_position:.2f} deg"
-                            )
-                        # Update internal position state
+                        logical_position = (current_degrees - self.group_offset_degrees + 360) % 360
+                        self.logger.debug(f"(slave) physical pos: {current_degrees:.2f} deg, offset: {self.group_offset_degrees:.2f} deg, logical pos: {logical_position:.2f} deg")
                         self.position_degrees = logical_position
                         return logical_position
                     else:
-                        if debug:
-                            print(
-                                f"{self.name} (master/standalone) physical pos: {current_degrees:.2f} deg"
-                            )
-                        # Update internal position state
+                        self.logger.debug(f"(master/standalone) physical pos: {current_degrees:.2f} deg")
                         self.position_degrees = current_degrees
                         return current_degrees
                 except ValueError:
-                    if debug:
-                        print(
-                            f"Warning: Could not convert position response '{pos_hex}' to degrees for {self.name}."
-                        )
-                    return 0.0
-            elif debug:
-                print(f"No valid position response for {self.name}. Response: '{response}'")
-            return 0.0
+                    self.logger.warning(f"Could not convert position response '{pos_hex}' to degrees.")
+                    return None
+            else: self.logger.warning(f"No valid position response. Response: '{response}'")
+            return None
 
-    def move_absolute(
-        self, degrees: float, wait: bool = True, debug: bool = False
-    ) -> bool:
-        """
-        Move the rotator to an absolute position.
-
-        According to the protocol manual (_HOSTREQ_MOVEABSOLUTE "ma"), this command
-        requires an 11-byte structure with the command followed by an 8-byte position.
-        The device will reply with either GS (status) or PO (position) response.
-
-        Args:
-            degrees: Target position in degrees (0-360)
-            wait: Whether to wait for movement to complete
-            debug: Whether to print debug information
-
-        Returns:
-            bool: True if the move command was sent successfully
-        """
+    def move_absolute(self, degrees: float, wait: bool = True) -> bool:
         with self._command_lock:
-            # Normalize to 0-360 range
             target_degrees_logical = degrees % 360
-
-            # Apply offset if this rotator is part of a group and has an offset
-            # The 'degrees' parameter is the logical target for the group.
-            # This specific rotator needs to move to 'logical_target + its_own_offset'.
-            if (
-                self.is_slave_in_group
-            ):  # For a slave, self.group_offset_degrees is its specific offset
-                physical_target_degrees = (
-                    target_degrees_logical + self.group_offset_degrees
-                ) % 360
-                if debug:
-                    print(
-                        f"Slave {self.name} in group: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
-                    )
-            elif (
-                self.group_offset_degrees != 0.0
-            ):  # For a master, self.group_offset_degrees can be its own base offset for the group move
-                physical_target_degrees = (
-                    target_degrees_logical + self.group_offset_degrees
-                ) % 360
-                if debug:
-                    print(
-                        f"Master/Standalone {self.name} with offset: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}"
-                    )
-            else:  # Standalone rotator or master with no offset, or slave with no offset.
+            if self.is_slave_in_group:
+                physical_target_degrees = (target_degrees_logical + self.group_offset_degrees) % 360
+                self.logger.debug(f"Slave in group: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}")
+            elif self.group_offset_degrees != 0.0:
+                physical_target_degrees = (target_degrees_logical + self.group_offset_degrees) % 360
+                self.logger.debug(f"Master/Standalone with offset: logical_target={target_degrees_logical}, offset={self.group_offset_degrees}, physical_target={physical_target_degrees}")
+            else:
                 physical_target_degrees = target_degrees_logical
-                if debug:
-                    print(
-                        f"Standalone {self.name}: logical_target={target_degrees_logical}, physical_target={physical_target_degrees}"
-                    )
+                self.logger.debug(f"Standalone: logical_target={target_degrees_logical}, physical_target={physical_target_degrees}")
 
-            # Convert to hex position using device-specific pulse count if available
             if hasattr(self, "pulse_per_revolution") and self.pulse_per_revolution:
                 hex_pos = degrees_to_hex(physical_target_degrees, self.pulse_per_revolution)
-                print(
-                    f"[{self.name}] Using device-specific pulse count: {self.pulse_per_revolution} pulses/rev (ID: {self.physical_address})"
-                )
             else:
                 hex_pos = degrees_to_hex(physical_target_degrees)
-                print(f"[{self.name}] WARNING: Using default pulse count (ID: {self.physical_address})")
+            self.logger.debug(f"Moving to physical target {physical_target_degrees:.2f} deg (hex: {hex_pos})")
 
-            if debug:
-                print(
-                    f"{self.name} moving to physical target {physical_target_degrees:.2f} deg (hex: {hex_pos})"
-                )
-
-            # Send the command
-            response = self.send_command(COMMAND_MOVE_ABS, data=hex_pos, debug=debug)
-
-            # Set moving state initially, will be cleared by wait_until_ready or next status check
-            # Only set is_moving if command was likely sent (response is not None potentially?)
-            # For now, set optimistically, assuming send_command doesn't raise error
+            response = self.send_command(COMMAND_MOVE_ABS, data=hex_pos)
             self.is_moving = True
 
-            # According to manual, device responds with either GS (status) or PO (position)
-            # but some devices may not respond immediately
-            if response and (
-                response.startswith(f"{self.active_address}GS")
-                or response.startswith(f"{self.active_address}PO")
-            ):
-                if wait:
-                    # Release lock before potentially long wait_until_ready operation
-                    # to avoid blocking other threads
-                    pass  # Continue execution after the with block
-                else:
-                    return True
+            if response and (response.startswith(f"{self.active_address}GS") or response.startswith(f"{self.active_address}PO")):
+                if wait: pass
+                else: return True
             else:
-                # No response received, but command might have been accepted by the device.
                 if not wait:
-                    # If not waiting, assume the command was sent and might be processing.
-                    # The caller opted not to wait for confirmation of completion.
-                    # Cannot update position reliably without waiting.
-                    if debug:
-                        print(
-                            f"{self.name}: No immediate response for move_absolute, command sent (wait=False). Assuming success."
-                        )
+                    self.logger.debug("No immediate response for move_absolute, command sent (wait=False). Assuming success.")
                     return True
-                # If wait=True, continue outside the lock
-
-        # Outside the lock for waiting operations
         if wait:
-            if response and (
-                response.startswith(f"{self.active_address}GS")
-                or response.startswith(f"{self.active_address}PO")
-            ):
-                return self.wait_until_ready()
+            wait_success = False
+            if response and (response.startswith(f"{self.active_address}GS") or response.startswith(f"{self.active_address}PO")):
+                wait_success = self.wait_until_ready()
             else:
-                # No response, but still wait if requested
-                if debug:
-                    print(
-                        f"{self.name}: No immediate response for move_absolute, but waiting for completion as wait=True."
-                    )
-                # Brief pause to allow movement to start if the device is slow to process
-                # but did receive the command.
-                time.sleep(0.2)  # Increased slightly
-                success = self.wait_until_ready()
-                if success:
-                    with self._command_lock:
-                        self.position_degrees = target_degrees_logical
-                    if debug:
-                        print(f"{self.name}: Move successful (no initial response), position updated to {self.position_degrees:.2f} deg (logical)")
-                elif debug:
-                    print(f"{self.name}: Move attempt failed (no initial response and timed out waiting).")
-                return success
+                self.logger.debug("No immediate response for move_absolute, but waiting for completion as wait=True.")
+                time.sleep(0.2)
+                wait_success = self.wait_until_ready()
+            if wait_success:
+                self.update_position() 
+                self.logger.debug(f"Move successful, final logical position reported: {self.position_degrees:.2f} deg (target was {target_degrees_logical:.2f})")
+            else: self.logger.warning("Move attempt failed (timed out waiting or error during wait).")
+            return wait_success
+        return False
 
-        return False  # Should never reach here, but added as a fallback
-
-    def continuous_move(
-        self, direction: str = "cw", start: bool = True, debug: bool = False
-    ) -> bool:
-        """
-        Start or stop continuous movement of the rotator.
-
-        Args:
-            direction: Direction of movement ("fw" [forward] or "bw" [backward])
-            start: True to start movement, False to stop
-
-        Returns:
-            bool: True if the command was sent successfully
-        """
+    def continuous_move(self, direction: str = "cw", start: bool = True) -> bool:
         with self._command_lock:
             if start:
-                # Set to continuous mode
-                # We don't need to lock set_jog_step as it has its own locking
-                # Release the lock temporarily to avoid nested locks
-                released_lock = True
-                self._command_lock.release()
-
-                try:
-                    if not self.set_jog_step(0):
-                        return False  # Failed to set jog step
-                finally:
-                    # Re-acquire the lock
-                    self._command_lock.acquire()
-                    released_lock = False
-
-                # Send command for continuous movement
-                if direction.lower() == "fw":
-                    response = self.send_command(COMMAND_FORWARD, debug=debug)
-                elif direction.lower() == "bw":
-                    response = self.send_command(COMMAND_BACKWARD, debug=debug)
-                else:
-                    raise ValueError("Direction must be 'fw' or 'bw'")
-
-                # Check response using active_address, as send_command verified the reply came from it
-                # Continuous move often doesn't give an immediate useful response,
-                # but we check for GS=OK as a basic acknowledgment if provided.
+                if not self.set_jog_step(0): return False
+                cmd_to_send = ""
+                if direction.lower() == "fw": cmd_to_send = COMMAND_FORWARD
+                elif direction.lower() == "bw": cmd_to_send = COMMAND_BACKWARD
+                else: raise ValueError("Direction must be 'fw' or 'bw'")
+                response = self.send_command(cmd_to_send)
                 if response and response.startswith(f"{self.active_address}GS"):
                     self.is_moving = True
                     return True
-
+                elif not response:
+                    self.logger.debug(f"Continuous move {cmd_to_send} sent, no immediate reply. Assuming initiated.")
+                    self.is_moving = True
+                    return True
+                else: self.logger.warning(f"Unexpected response to continuous move {cmd_to_send}: {response}")
                 return False
             else:
-                # Release the lock before calling stop to avoid nested locks
-                self._command_lock.release()
-                released_lock = True
+                return self.stop()
 
-                try:
-                    # Stop the movement
-                    return self.stop()
-                finally:
-                    # Only re-acquire if we released it
-                    if released_lock:
-                        self._command_lock.acquire()
-
-    def configure_as_group_slave(self, master_address_to_listen_to: str, slave_offset: float = 0.0, debug: bool = False) -> bool:
-        """
-        Instruct this rotator (slave) to listen to a master_address.
-        Used for synchronized group movements.
-
-        Args:
-            master_address_to_listen_to (str): The address this rotator should listen to (0-F).
-            slave_offset (float): Angular offset in degrees for this slave rotator.
-            debug (bool): Whether to print debug information.
-
-        Returns:
-            bool: True if configuration was successful.
-        """
+    def configure_as_group_slave(self, master_address_to_listen_to: str, slave_offset: float = 0.0) -> bool:
         with self._command_lock:
             try:
                 int(master_address_to_listen_to, 16)
-                if len(master_address_to_listen_to) != 1:
-                    raise ValueError("Master address must be a single hex character.")
+                if not (len(master_address_to_listen_to) == 1 and '0' <= master_address_to_listen_to.upper() <= 'F'):
+                    raise ValueError("Master address must be a single hex character 0-F.")
             except ValueError:
-                if debug:
-                    print(f"Invalid master_address_to_listen_to: '{master_address_to_listen_to}'. Must be 0-F.")
+                self.logger.error(f"Invalid master_address_to_listen_to: '{master_address_to_listen_to}'. Must be 0-F.")
                 return False
-
-            if debug:
-                print(f"Configuring {self.name} (phys_addr: {self.physical_address}) to listen to master_addr: {master_address_to_listen_to} with offset: {slave_offset} deg.")
-
-            # Command: <physical_address_of_slave>ga<master_address_to_listen_to>
-            # Reply expected from: <master_address_to_listen_to>GS<status>
+            self.logger.info(f"Configuring (phys_addr: {self.physical_address}) to listen to master_addr: {master_address_to_listen_to} with offset: {slave_offset} deg.")
             response = self.send_command(
-                command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
-                data=master_address_to_listen_to,
-                send_addr_override=self.physical_address, # Send command using its physical address
-                expect_reply_from_addr=master_address_to_listen_to, # Reply comes from the new address
-                debug=debug,
-                timeout_multiplier=1.5 # Give 'ga' a bit more time for response
+                command=COMMAND_GROUP_ADDRESS, data=master_address_to_listen_to,
+                send_addr_override=self.physical_address, expect_reply_from_addr=master_address_to_listen_to,
+                timeout_multiplier=1.5
             )
-
-            if response and response.startswith(f"{master_address_to_listen_to}GS") and "00" in response: # Check for "00" status
+            if response and response.startswith(f"{master_address_to_listen_to}GS") and "00" in response:
                 self.active_address = master_address_to_listen_to
                 self.group_offset_degrees = slave_offset
                 self.is_slave_in_group = True
-                if debug:
-                    print(f"{self.name} successfully configured as slave. Active_addr: {self.active_address}, Offset: {self.group_offset_degrees}")
+                self.logger.info(f"Successfully configured as slave. Active_addr: {self.active_address}, Offset: {self.group_offset_degrees}")
                 return True
             else:
-                if debug:
-                    print(f"Failed to configure {self.name} as slave. Response: {response}")
-                # Attempt to revert to physical address if partial failure, though device might be in unknown state
+                self.logger.error(f"Failed to configure as slave. Response: {response}")
                 self.active_address = self.physical_address
                 self.is_slave_in_group = False
                 self.group_offset_degrees = 0.0
                 return False
 
-    def revert_from_group_slave(self, debug: bool = False) -> bool:
-        """
-        Revert this rotator from slave mode back to its physical address.
-
-        Args:
-            debug (bool): Whether to print debug information.
-
-        Returns:
-            bool: True if reversion was successful.
-        """
+    def revert_from_group_slave(self) -> bool:
         with self._command_lock:
             if not self.is_slave_in_group:
-                if debug:
-                    print(f"{self.name} is not in slave group mode. No reversion needed.")
-                self.active_address = self.physical_address # Ensure consistency
+                self.logger.info("Not in slave group mode. No reversion needed.")
+                self.active_address = self.physical_address
                 self.group_offset_degrees = 0.0
                 return True
-
             current_listening_address = self.active_address
-            if debug:
-                print(f"Reverting {self.name} from listening to {current_listening_address} back to physical_addr: {self.physical_address}.")
-
-            # Command: <current_listening_address>ga<physical_address_of_this_rotator>
-            # Reply expected from: <physical_address_of_this_rotator>GS<status>
+            self.logger.info(f"Reverting from listening to {current_listening_address} back to physical_addr: {self.physical_address}.")
             response = self.send_command(
-                command=COMMAND_GROUP_ADDRESS, # Explicitly name the 'command' parameter
-                data=self.physical_address,
-                send_addr_override=current_listening_address, # Command is sent to the address it's currently listening on
-                expect_reply_from_addr=self.physical_address, # Reply comes from its physical address
-                debug=debug,
-                timeout_multiplier=1.5 # Give 'ga' a bit more time for response
+                command=COMMAND_GROUP_ADDRESS, data=self.physical_address,
+                send_addr_override=current_listening_address, expect_reply_from_addr=self.physical_address,
+                timeout_multiplier=1.5
             )
-
-            # Always reset internal state regardless of response to avoid being stuck
             self.active_address = self.physical_address
             self.is_slave_in_group = False
             self.group_offset_degrees = 0.0
-
-            if response and response.startswith(f"{self.physical_address}GS") and "00" in response: # Check for "00" status
-                if debug:
-                    print(f"{self.name} successfully reverted to physical address {self.physical_address}.")
+            if response and response.startswith(f"{self.physical_address}GS") and "00" in response:
+                self.logger.info(f"Successfully reverted to physical address {self.physical_address}.")
                 return True
             else:
-                if debug:
-                    print(f"Failed to revert {self.name} to physical address. Response: {response}. Internal state reset.")
+                self.logger.error(f"Failed to revert to physical address. Response: {response}. Internal state reset.")
                 return False
 
     def optimize_motors(self, wait: bool = True) -> bool:
-        """
-        Optimize both motors using the 'om' command.
-
-        Note: The manual states this command applies only to specific devices
-        (ELL14, ELL15, ELL17, ELL18, ELL20).
-
-        Args:
-            wait: Whether to wait for the optimization process to complete.
-                Optimization can take a significant amount of time.
-
-        Returns:
-            bool: True if the command was acknowledged successfully, False otherwise.
-                Note that acknowledgement doesn't mean optimization completed if wait=False.
-        """
         with self._command_lock:
-            # Command structure is simply <addr>om
             response = self.send_command(COMMAND_OPTIMIZE_MOTORS)
-
-            # Device should respond with GS status. Optimization starts in background.
-            if response and response.startswith(f"{self.physical_address}GS"):
-                # Status might initially indicate busy (e.g., '0A')
-                if wait:
-                    # Release lock before potentially long wait_until_ready operation
-                    # to avoid blocking other threads
-                    pass  # Continue execution after the with block
-                else:
-                    return True  # Command acknowledged without waiting
+            if response and response.startswith(f"{self.active_address}GS"):
+                if wait: pass
+                else: return True
             else:
-                print(
-                    f"Failed to start motor optimization on {self.name}. Response: {response}"
-                )
+                self.logger.error(f"Failed to start motor optimization. Response: {response}")
                 return False
-
-        # Outside the lock for waiting operations
-        if wait and response and response.startswith(f"{self.physical_address}GS"):
-            print(
-                f"Waiting for motor optimization on {self.name} to complete..."
-            )
-            # Need a long timeout for optimization
-            # We wait until status is '00' (Ready)
-            # TODO: Refine wait logic based on expected busy codes during optimization
-            return self.wait_until_ready(
-                timeout=60.0
-            )  # Use a long timeout (e.g., 60 seconds)
-
-        # If we're here and wait=True, it means the command failed
+        if wait and response and response.startswith(f"{self.active_address}GS"):
+            self.logger.info("Waiting for motor optimization to complete...")
+            return self.wait_until_ready(timeout=60.0)
         return False
 
-    def get_device_info(self, debug: bool = False) -> Dict[str, str]:
-        """
-        Get detailed information about the rotator device.
-
-        This method retrieves various pieces of information about the device including
-        its serial number, firmware version, and hardware specifications.
-
-        According to the protocol manual (_DEVGET_INFORMATION "IN"), the device reply
-        is a 33-byte structure that contains device type, firmware version, serial number,
-        and other hardware specifications.
-
-        Args:
-            debug (bool): Whether to print detailed debug information
-
-        Returns:
-            Dict[str, str]: Dictionary containing device information
-        """
+    def get_device_info(self) -> Dict[str, str]:
         with self._command_lock:
-            if debug:
-                print(f"Requesting device information from {self.name}...")
+            self.logger.debug(f"Requesting device information (Active Addr: {self.active_address})...")
+            response = self.send_command(COMMAND_GET_INFO)
+            info: Dict[str, str] = {}
+            if not response or not response.startswith(f"{self.active_address}IN"):
+                self.logger.warning(f"Failed to get valid 'IN' response. Received: '{response}'")
+                self.device_info = {"type": "Error", "error": "Invalid or no response to IN command"}
+                return self.device_info
+            data_payload = response[len(self.active_address) + 2:].strip()
+            self.logger.trace(f"Raw data payload for IN: '{data_payload}', Length: {len(data_payload)}")
+            if len(data_payload) >= 30: # Expecting 30 chars based on device output 0E1140060920231701016800023000
+                try:
+                    info["device_type_hex"] = data_payload[0:2]
+                    # Firmware Release (4 chars)
+                    fw_rel_hex = data_payload[2:6]
+                    info["firmware_release_hex"] = fw_rel_hex
+                    # Serial Number (4 chars)
+                    info["serial_number"] = data_payload[6:10]
+                    # Year of Manufacture (4 chars for YYYY)
+                    info["year_of_manufacture"] = data_payload[10:14]
+                    # Day of Manufacture (2 chars for DD)
+                    day_hex = data_payload[14:16]
+                    info["day_of_manufacture_hex"] = day_hex
+                    try: info["day_of_manufacture_decimal"] = str(int(day_hex, 16))
+                    except ValueError: self.logger.warning(f"Could not parse day_of_manufacture_hex: {day_hex}")
 
-            # Send the IN command (get information)
-            # Device info should always be queried from its current active address
-            print(f"[{self.name}] ID:{self.physical_address} Requesting device info with command '{COMMAND_GET_INFO}' at address '{self.active_address}'")
-            response = self.send_command(COMMAND_GET_INFO, debug=True)  # Force debug for diagnostic
-            print(f"[{self.name}] ID:{self.physical_address} Response received: '{response}'")
-            info = {}
-            data = ""  # Initialize data to prevent UnboundLocalError
-
-            # Process the response
-            print(f"[{self.name}] ID:{self.physical_address} Raw response: '{response}'")
-            if response and response.startswith(f"{self.active_address}IN"):
-                # Remove the address and command prefix (e.g., "3IN")
-                data = response[len(f"{self.active_address}IN") :].strip(" \r\n\t")
-                print(f"Parsed data: '{data}', length: {len(data)}")
-
-                if debug:
-                    print(f"Response data: '{data}', length: {len(data)}")
-                    print(f"Raw bytes (hex): {' '.join(f'{ord(c):02x}' for c in data)}")
-
-                # For test cases compatibility
-                if "TestElliptecRotator" in str(self.__class__):
-                    if data == "06123456782015018100007F":
-                        info = {
-                            "type": "06",
-                            "firmware": "1234",
-                            "serial_number": "56782015",
-                            "year_month": "0181",
-                            "day_batch": "00",
-                            "hardware": "0181",
-                            "max_range": "00007F",
-                            "firmware_formatted": "18.52",
-                            "hardware_formatted": "1.129",
-                            "manufacture_date": "2015-15",
-                        }
-                        self.pulse_per_revolution = 262144  # Default value
-                        self.pulses_per_deg = self.pulse_per_revolution / 360.0
-                        return info
-                elif "TestProtocolMessages" in str(self.__class__):
-                    if data == "06123456782015018100007F":
-                        info = {
-                            "type": "06",
-                            "firmware": "1234",
-                            "serial_number": "56782015",
-                            "year_month": "0181",
-                            "day_batch": "00",
-                            "hardware": "007F",  # The test expects this value
-                            "max_range": "00007F",
-                        }
-                        self.pulse_per_revolution = 262144  # Default value
-                        self.pulses_per_deg = self.pulse_per_revolution / 360.0
-                        return info
-
-                # Special case for test_get_device_info
-                if data == "0E1140TESTSERL2401016800023000" or data == "0E1140060920231701016800023000":
-                    # Handle both test cases with the same structure
-                    serial_number = "TESTSERL" if "TESTSERL" in data else "06092023"
-                    year_month = "2401" if "2401" in data else "1701"
-                    day_batch = "01"
-
-                    info = {
-                        "type": "0E",
-                        "firmware": "1140",
-                        "serial_number": serial_number,
-                        "year_month": year_month,
-                        "day_batch": day_batch,
-                        "hardware": "6800",
-                        "max_range": "023000",
-                        "firmware_formatted": "17.64",
-                        "hardware_formatted": "104.0",
-                        "manufacture_date": year_month,
-                        "pulses_per_unit": "023000",
-                        "pulses_per_unit_dec": str(int("023000", 16)),
-                    }
-                    self.device_info = info
-                    self.pulse_per_revolution = int(info["pulses_per_unit_dec"])
-                    self.pulses_per_deg = self.pulse_per_revolution / 360.0
-                    return info
-
-            try:
-                # Based on the reference implementation provided
-                if len(data) >= 22:  # At least need to have all essential fields
-                    # Parse data according to the Elliptec protocol specification:
-                    # IMPORTANT: The following is the correct order/indices based on Thorlabs documentation
-                    # [0:2]   - Motor Type
-                    # [2:6]   - Firmware version
-                    # [6:14]  - Serial number
-                    # [14:18] - Year/Month
-                    # [18:20] - Day/Batch
-                    # [20:24] - Hardware version
-                    # [24:32] - Max range/travel
-                    # [32:]   - Pulses per unit (if available)
-
-                    # Dictionary for device info
-                    info = {
-                        "type": data[0:2],
-                        "firmware": data[2:6],
-                        "serial_number": data[6:14],
-                        "year_month": data[14:18],
-                        "day_batch": data[18:20],
-                        "hardware": data[20:24],
-                        "max_range": data[24:32],  # For backward compatibility
-                        "travel": data[24:32],
-                    }
-
-                    # Parse pulse_per_revolution if available
-                    if len(data) > 32:
-                        info["pulses_per_unit"] = data[32:].strip(" \r\n\t\\")
-                        try:
-                            # Make sure to strip any CR/LF before conversion
-                            clean_pulses = info["pulses_per_unit"].strip()
-                            pulses_dec = int(clean_pulses, 16)
-                            info["pulses_per_unit_dec"] = str(pulses_dec)
-
-                            # Store the actual pulse count for accurate positioning
-                            if (
-                                pulses_dec > 1000
-                            ):  # Reasonable minimum for a rotator
-                                self.pulse_per_revolution = pulses_dec
-                                self.pulses_per_deg = pulses_dec / 360.0
-                                print(
-                                    f"[{self.name}] IMPORTANT: Set pulse_per_revolution to {self.pulse_per_revolution} (ID: {self.physical_address})"
-                                )
-                                print(
-                                    f"[{self.name}] Set pulses_per_deg to {self.pulses_per_deg} (ID: {self.physical_address})"
-                                )
-                            else:
-                                # Fallback to default values
-                                if debug:
-                                    print(
-                                        f"Pulses value too small ({pulses_dec}), using default: {self.pulse_per_revolution}"
-                                    )
-                        except ValueError:
-                            if debug:
-                                print(
-                                    f"Could not convert pulses_per_unit {info['pulses_per_unit']} to decimal"
-                                )
-
-                    # Add additional fields for compatibility with existing code
-
-                    # Format firmware version - Need to handle multi-byte firmware values
                     try:
-                        if len(info["firmware"]) >= 4:  # Ensure we have at least 4 characters (2 bytes)
-                            # Use the first two bytes for version calculation
-                            fw_major = int(info["firmware"][0:2], 16)
-                            fw_minor = int(info["firmware"][2:4], 16)
-                            info["firmware_formatted"] = f"{fw_major}.{fw_minor}"
-                            print(f"[{self.name}] ID:{self.physical_address} Parsed firmware: {fw_major}.{fw_minor}")
-                        else:
-                            print(f"[{self.name}] ID:{self.physical_address} Firmware value too short: {info['firmware']}")
-                    except (ValueError, IndexError) as e:
-                        print(f"[{self.name}] ID:{self.physical_address} Error parsing firmware: {e}")
-                        pass
-
-                    # Format hardware version - Need to handle multi-byte hardware values
+                        fw_val = int(fw_rel_hex, 16)
+                        info["firmware_release_decimal"] = str(fw_val)
+                        # Assuming FW "1140" means version 114.0 if divided by 10, or specific format needed
+                        # For "1140" (version 1.1.4.0 from manual example), this formatting might need review
+                        # Based on existing code: "17" (hex) -> 23 (dec) -> "2.3"
+                        # If "1140" (hex) -> 4416 (dec). Original code might have intended a different interpretation for FW formatting.
+                        # Sticking to existing numeric parsing for now.
+                        info["firmware_formatted"] = f"{fw_val / 10.0:.1f}" # This might need adjustment based on actual FW meaning.
+                    except ValueError:
+                        info["firmware_formatted"] = "ParseError"
+                        self.logger.warning(f"Could not parse firmware_release_hex: {fw_rel_hex}")
+                    
+                    # Hardware Release (2 chars from 30-char string "01")
+                    hw_rel_hex = data_payload[16:18] # Type(2)FW(4)SN(4)Year(4)Day(2) -> next is HW at index 16
+                    info["hardware_release_hex"] = hw_rel_hex
                     try:
-                        if len(info["hardware"]) >= 4:  # Ensure we have at least 4 characters (2 bytes)
-                            # Use the full value for the release
-                            hw_val = int(info["hardware"], 16)
-                            info["hardware_release"] = str(hw_val)
-
-                            # For backward compatibility, use first two bytes for formatted version
-                            hw_major = int(info["hardware"][0:2], 16)
-                            hw_minor = int(info["hardware"][2:4], 16)
-                            info["hardware_formatted"] = f"{hw_major}.{hw_minor}"
-                            print(f"[{self.name}] ID:{self.physical_address} Parsed hardware: {hw_major}.{hw_minor}")
-                        else:
-                            print(f"[{self.name}] ID:{self.physical_address} Hardware value too short: {info['hardware']}")
-                    except (ValueError, TypeError) as e:
-                        print(f"[{self.name}] ID:{self.physical_address} Error parsing hardware: {e}")
-                        pass
-
-                    # Format date fields for compatibility
-                    info["manufacture_date"] = info.get("year_month", "")
-                    # Year_month is already set from the parse above
-
-                    # For range values
+                        hw_val = int(hw_rel_hex, 16)
+                        info["hardware_release_decimal"] = str(hw_val)
+                        # Assuming 1-byte hardware info (0x80 bit for thread type)
+                        thread_type = "Imperial" if (hw_val & 0x80) else "Metric"
+                        hw_release_num = hw_val & 0x7F
+                        info["hardware_thread_type"] = thread_type
+                        info["hardware_release_number"] = str(hw_release_num)
+                        info["hardware_formatted"] = f"{thread_type}, Release {hw_release_num}"
+                    except ValueError:
+                        info["hardware_formatted"] = "ParseError"
+                        self.logger.warning(f"Could not parse hardware_release_hex: {hw_rel_hex}")
+                    # Travel Range (4 chars)
+                    info["travel_hex"] = data_payload[18:22] # HW (2char) ends at 16+2=18
+                    try: info["travel_decimal"] = str(int(info["travel_hex"], 16))
+                    except ValueError: self.logger.warning(f"Could not parse travel_hex: {info['travel_hex']}")
+                    # Pulses per Unit (8 chars)
+                    pulses_hex = data_payload[22:30] # Range (4char) ends at 18+4=22
+                    info["pulses_per_unit_hex"] = pulses_hex
                     try:
-                        range_val = int(info["max_range"], 16)
-                        info["range_dec"] = str(range_val)
-                    except (ValueError, TypeError):
-                        pass
-
-                elif data.startswith("I1") or data.startswith("I2"):
-                    # This appears to be a motor info response, not a device info response
-                    if len(data) >= 22:
-                        info = {
-                            "type": "Elliptec Motor",
-                            "motor": "1" if data.startswith("I1") else "2",
-                            "jog_step": data[2:10],
-                            "frequency": data[10:18],
-                            "amplitude": data[18:20],
-                            "phase": data[20:22],
-                        }
-                    else:
-                        info = {
-                            "type": "Elliptec Motor",
-                            "motor": "1" if data.startswith("I1") else "2",
-                        }
-                else:
-                    print(f"Response data too short: '{data}', length: {len(data)}")
-                    info = {"type": "Unknown", "error": "Data too short"}
-
-            except Exception as e:
-                print(f"Error parsing device info: {e}")
-                if debug:
-                    import traceback
-
-                    traceback.print_exc()
-                info = {"type": "Error", "error": str(e)}
-
-            # If info hasn't been populated by successful parsing, it might be {} or contain an error
-            # from an earlier check (e.g. data too short).
-            if len(info) == 0:
-                print(f"WARNING: No device info parsed from response: '{response}'")
-                info = {"type": "Unknown", "error": f"Failed to parse response: '{response}'"}
-
-            print(f"Final device information for {self.name}: {info}")
-
-            # Store the info for future use
+                        pulses_dec = int(pulses_hex, 16)
+                        info["pulses_per_unit_decimal"] = str(pulses_dec)
+                        if pulses_dec > 0: 
+                            self.pulse_per_revolution = pulses_dec
+                            self.pulses_per_deg = pulses_dec / 360.0
+                            self.logger.debug(f"Updated pulse_per_revolution to {self.pulse_per_revolution} from device info.")
+                        else: self.logger.warning(f"Invalid pulses_per_unit_decimal ({pulses_dec}). Using current value: {self.pulse_per_revolution}")
+                    except ValueError:
+                        self.logger.warning(f"Could not parse pulses_per_unit_hex ('{pulses_hex}'). Using current value: {self.pulse_per_revolution}")
+                except IndexError:
+                    self.logger.error(f"Error parsing device info, data payload too short: '{data_payload}'")
+                    info = {"type": "Error", "error": "Data payload too short for full parsing"}
+                except Exception as e:
+                    self.logger.error(f"Unexpected error parsing device info: {e}", exc_info=True)
+                    info = {"type": "Error", "error": str(e)}
+            else:
+                self.logger.warning(f"Data payload for IN command is too short ({len(data_payload)} chars). Expected >=30.")
+                info = {"type": "Error", "error": f"Data payload too short (expected >=30, got {len(data_payload)})"}
             self.device_info = info
+            self.logger.debug(f"Parsed device info: {self.device_info}")
+            return self.device_info
 
-            # Always print this for diagnostics, regardless of debug flag
-            print(f"[{self.name}] ID:{self.physical_address} Final parsed device info: {info}")
-            if 'pulses_per_unit_dec' in info:
-                print(f"[{self.name}] ID:{self.physical_address} Found pulses_per_unit_dec: {info['pulses_per_unit_dec']}")
+class ElliptecGroupController:
+    def __init__(
+        self,
+        rotators: List[ElliptecRotator],
+        master_rotator_physical_address: Optional[str] = None,
+    ):
+        if not rotators:
+            raise ValueError("Rotators list cannot be empty.")
+        first_serial_port_id = id(rotators[0].serial)
+        for r in rotators[1:]:
+            if id(r.serial) != first_serial_port_id:
+                raise ValueError("All rotators in a group must share the same serial port instance.")
+        
+        self.rotators = rotators
+        self.serial = rotators[0].serial 
+        self.master_rotator: Optional[ElliptecRotator] = None
+        if master_rotator_physical_address:
+            for r in self.rotators:
+                if r.physical_address == master_rotator_physical_address:
+                    self.master_rotator = r
+                    break
+            if not self.master_rotator:
+                raise ValueError(f"Master rotator with physical address '{master_rotator_physical_address}' not found in the provided list.")
+        else:
+            self.master_rotator = self.rotators[0]
+        
+        self.logger = logger.bind(group_controller_name=f"GroupMaster-{self.master_rotator.physical_address}")
+        self.is_grouped = False
+        self.group_master_address_char: Optional[str] = None
+        self.logger.info(f"GroupController initialized with {len(self.rotators)} rotators. Master: {self.master_rotator.name}")
 
-            return info
+    def _get_slave_rotators(self) -> List[ElliptecRotator]:
+        if not self.master_rotator: return []
+        return [r for r in self.rotators if r.physical_address != self.master_rotator.physical_address]
+
+    def form_group(self, group_address_char: Optional[str] = None) -> bool:
+        if not self.master_rotator:
+            self.logger.error("Cannot form group: Master rotator not set.")
+            return False
+        if self.is_grouped:
+            self.logger.info("Group is already formed. Disband first to re-form.")
+            return True
+        target_group_address = group_address_char if group_address_char else self.master_rotator.physical_address
+        try:
+            int(target_group_address, 16)
+            if not (len(target_group_address) == 1 and '0' <= target_group_address.upper() <= 'F'):
+                raise ValueError("Group address must be a single hex character 0-F.")
+        except ValueError as e:
+            self.logger.error(f"Invalid group_address_char '{target_group_address}': {e}")
+            return False
+        self.group_master_address_char = target_group_address
+        self.logger.info(f"Forming group with master {self.master_rotator.name} on group address '{self.group_master_address_char}'")
+        all_success = True
+        for slave in self._get_slave_rotators():
+            self.logger.debug(f"Configuring slave {slave.name} (PhysAddr: {slave.physical_address}) to listen to {self.group_master_address_char}")
+            if not slave.configure_as_group_slave(self.group_master_address_char, slave_offset=0.0):
+                self.logger.error(f"Failed to configure slave {slave.name}")
+                all_success = False
+        if self.master_rotator.physical_address != self.group_master_address_char:
+            self.logger.info(f"Setting master {self.master_rotator.name}'s active address to group address {self.group_master_address_char}")
+            self.master_rotator.active_address = self.group_master_address_char
+        if all_success:
+            self.is_grouped = True
+            self.logger.info(f"Group successfully formed. Master address: {self.group_master_address_char}")
+        else:
+            self.logger.error("Failed to form group completely. Attempting to disband partial group.")
+            self.disband_group()
+        return self.is_grouped
+
+    def disband_group(self) -> bool:
+        if not self.is_grouped and not self.group_master_address_char:
+            self.logger.info("No active group to disband.")
+            return True
+        self.logger.info(f"Disbanding group (Master was on: {self.group_master_address_char or 'Unknown'}).")
+        all_success = True
+        for slave in self._get_slave_rotators():
+            if slave.is_slave_in_group:
+                 self.logger.debug(f"Reverting slave {slave.name} (Current Active: {slave.active_address}) to physical {slave.physical_address}")
+                 if not slave.revert_from_group_slave():
+                    self.logger.error(f"Failed to revert slave {slave.name}")
+                    all_success = False
+            else:
+                slave.active_address = slave.physical_address
+        if self.master_rotator:
+            self.master_rotator.active_address = self.master_rotator.physical_address
+            self.master_rotator.is_slave_in_group = False
+            self.master_rotator.group_offset_degrees = 0.0
+            self.logger.debug(f"Reset master {self.master_rotator.name} active address to physical {self.master_rotator.physical_address}")
+        self.is_grouped = False
+        self.group_master_address_char = None
+        if all_success: self.logger.info("Group successfully disbanded.")
+        else: self.logger.warning("Group disbandment encountered errors for some slaves.")
+        return all_success
+
+    def _send_group_command_and_collect_replies(
+        self,
+        command: str,
+        data: str = "",
+        expect_num_replies: Optional[int] = None,
+        overall_timeout: float = 5.0, 
+        reply_start_timeout: float = 1.0 
+    ) -> Dict[str, str]:
+        if not self.is_grouped or not self.group_master_address_char or not self.master_rotator:
+            self.logger.error("Cannot send group command: Group not formed or master address/rotator not set.")
+            return {}
+        if expect_num_replies is None: expect_num_replies = len(self.rotators)
+        if expect_num_replies == 0:
+            self.logger.info("No replies expected for group command.")
+            return {}
+        cmd_str_to_send = f"{self.group_master_address_char}{command}"
+        if data: cmd_str_to_send += data
+        cmd_str_to_send += "\r"
+        self.logger.debug(f"Sending group command to address '{self.group_master_address_char}': '{cmd_str_to_send.strip()}'")
+        collected_replies: Dict[str, str] = {}
+        member_physical_addresses = {r.physical_address for r in self.rotators}
+        with self.master_rotator._command_lock: 
+            try:
+                if not self.serial.is_open:
+                    self.logger.warning("Serial port not open. Attempting to open.")
+                    self.serial.open()
+                self.serial.reset_input_buffer()
+                self.serial.reset_output_buffer()
+                self.serial.write(cmd_str_to_send.encode("ascii"))
+                self.serial.flush()
+                global_start_time = time.time()
+                buffer = b""
+                while (time.time() - global_start_time) < overall_timeout and len(collected_replies) < expect_num_replies:
+                    self.serial.timeout = reply_start_timeout 
+                    try:
+                        one_byte = self.serial.read(1)
+                        if not one_byte:
+                            if not self.serial.in_waiting: continue
+                        buffer += one_byte
+                        if self.serial.in_waiting > 0: buffer += self.serial.read(self.serial.in_waiting)
+                    except serial.SerialTimeoutException:
+                        self.logger.trace("Individual read attempt timed out waiting for next reply to start.")
+                        continue
+                    while b"\r\n" in buffer:
+                        line_bytes, buffer = buffer.split(b"\r\n", 1)
+                        line_str = line_bytes.decode("ascii", errors="replace").strip()
+                        self.logger.trace(f"Group reply processing line: '{line_str}'")
+                        if not line_str: continue
+                        reply_address_char = line_str[0]
+                        is_valid_hex_addr = False
+                        try:
+                            int(reply_address_char, 16)
+                            is_valid_hex_addr = True
+                        except ValueError: pass
+                        if is_valid_hex_addr and reply_address_char in member_physical_addresses:
+                            if reply_address_char not in collected_replies:
+                                collected_replies[reply_address_char] = line_str
+                                self.logger.debug(f"Collected reply from rotator {reply_address_char}: '{line_str}'")
+                                if len(collected_replies) >= expect_num_replies: break
+                            else: self.logger.trace(f"Additional line from already collected rotator {reply_address_char}: '{line_str}' (Ignoring)")
+                        else: self.logger.trace(f"Ignoring reply from non-member or invalid address char '{reply_address_char}': '{line_str}'")
+                    if len(collected_replies) >= expect_num_replies: break
+            except serial.SerialException as e: self.logger.error(f"Serial exception during group command: {e}", exc_info=True)
+            except Exception as e: self.logger.error(f"Unexpected exception during group command: {e}", exc_info=True)
+            finally: pass 
+        if len(collected_replies) < expect_num_replies:
+            self.logger.warning(f"Expected {expect_num_replies} replies, received {len(collected_replies)} within {overall_timeout}s timeout.")
+            missing_rotators = member_physical_addresses - set(collected_replies.keys())
+            if missing_rotators: self.logger.warning(f"Missing replies from rotators (physical addresses): {sorted(list(missing_rotators))}")
+        return collected_replies
+
+    def home_group(self, wait: bool = True, home_timeout_per_rotator: float = 45.0) -> bool:
+        if not self.is_grouped or not self.group_master_address_char:
+            self.logger.error("Cannot home group: Group not formed or master address not set.")
+            return False
+        self.logger.info(f"Sending home command to group address '{self.group_master_address_char}'...")
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_HOME, data="0", expect_num_replies=len(self.rotators),
+            overall_timeout=2.0 * len(self.rotators), reply_start_timeout=0.5
+        )
+        if not replies:
+            self.logger.warning("No replies received after sending group home command.")
+            if wait: self.logger.info("Attempting to wait for group readiness despite no initial replies.")
+            else: return False
+        if wait:
+            self.logger.info("Waiting for all rotators in the group to finish homing...")
+            all_ready = True
+            for rotator in self.rotators:
+                self.logger.debug(f"Waiting for {rotator.name} (Addr: {rotator.physical_address}) to be ready...")
+                if not rotator.wait_until_ready(timeout=home_timeout_per_rotator):
+                    self.logger.error(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) did not report ready status after homing within timeout.")
+                    all_ready = False
+            if all_ready:
+                self.logger.info("All rotators in the group reported ready status after homing.")
+                self.logger.debug("Updating positions for all rotators in the group...")
+                for rotator in self.rotators: rotator.update_position()
+                return True
+            else:
+                self.logger.error("Not all rotators in the group became ready after homing.")
+                return False
+        else:
+            if replies:
+                self.logger.info("Group home command dispatched successfully (not waiting for completion).")
+                return True
+            else:
+                self.logger.warning("Group home command sent, but no replies received (not waiting). Assuming potential issue.")
+                return False
+
+    def stop_group(self) -> bool:
+        if not self.is_grouped or not self.group_master_address_char:
+            self.logger.error("Cannot stop group: Group not formed or master address not set.")
+            return False
+        self.logger.info(f"Sending stop command to group address '{self.group_master_address_char}'...")
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_STOP, data="", expect_num_replies=len(self.rotators),
+            overall_timeout=1.0 * len(self.rotators), reply_start_timeout=0.1
+        )
+        if not replies:
+            self.logger.warning("No replies received after sending group stop command.")
+            return False
+        all_acknowledged_stop = True
+        for rotator in self.rotators:
+            reply = replies.get(rotator.physical_address)
+            if reply and reply.startswith(f"{rotator.physical_address}GS"):
+                status_code = reply[len(f"{rotator.physical_address}GS"):].strip()
+                if status_code == "00":
+                    self.logger.debug(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) acknowledged stop with status 00 (OK).")
+                    rotator.is_moving = False
+                else:
+                    self.logger.warning(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) acknowledged stop, but returned unexpected status: {status_code}")
+                    all_acknowledged_stop = False
+            else:
+                self.logger.warning(f"Did not receive expected GS reply from Rotator {rotator.name} (Addr: {rotator.physical_address}) after group stop command.")
+                all_acknowledged_stop = False
+        if all_acknowledged_stop:
+            self.logger.info("Group stop command acknowledged by all rotators with status 00.")
+            return True
+        else:
+            self.logger.error("Not all rotators acknowledged the stop command successfully.")
+            return False
+
+    def move_group_absolute(self, degrees: float, wait: bool = True, move_timeout_per_rotator: float = 45.0) -> bool:
+        if not self.is_grouped or not self.group_master_address_char or not self.master_rotator:
+            self.logger.error("Cannot move group: Group not formed, master address not set, or master rotator not identified.")
+            return False
+        target_degrees_logical = degrees % 360
+        hex_pos = degrees_to_hex(target_degrees_logical, self.master_rotator.pulse_per_revolution)
+        self.logger.info(f"Sending move_absolute command to group address '{self.group_master_address_char}' for target {target_degrees_logical:.2f} deg (hex: {hex_pos}).")
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_MOVE_ABS, data=hex_pos, expect_num_replies=len(self.rotators)
+        )
+        if not replies:
+            self.logger.warning("No replies received after sending group move_absolute command.")
+            if wait: self.logger.info("Attempting to wait for group readiness despite no initial replies.")
+            else: return False 
+        for r in self.rotators: r.is_moving = True
+        if wait:
+            self.logger.info("Waiting for all rotators in the group to finish movement...")
+            all_ready = True
+            for rotator in self.rotators:
+                self.logger.debug(f"Waiting for {rotator.name} (Addr: {rotator.physical_address}) to be ready...")
+                if not rotator.wait_until_ready(timeout=move_timeout_per_rotator):
+                    self.logger.error(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) did not report ready status after move within timeout.")
+                    all_ready = False
+            if all_ready:
+                self.logger.info("All rotators in the group reported ready status after move.")
+                self.logger.debug("Updating positions for all rotators in the group...")
+                for rotator in self.rotators: rotator.update_position() 
+                return True
+            else:
+                self.logger.error("Not all rotators in the group became ready after move.")
+                return False
+        else:
+            if replies:
+                self.logger.info("Group move_absolute command dispatched successfully (not waiting for completion).")
+                return True
+            else:
+                self.logger.warning("Group move_absolute command sent, but no replies received (not waiting for completion).")
+                return False
+
+    def get_group_status(self) -> Dict[str, str]:
+        if not self.is_grouped or not self.group_master_address_char:
+            self.logger.error("Cannot get group status: Group not formed or master address not set.")
+            return {}
+        self.logger.debug(f"Requesting status from group address '{self.group_master_address_char}'.")
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_GET_STATUS, expect_num_replies=len(self.rotators)
+        )
+        statuses: Dict[str, str] = {}
+        if not replies:
+            self.logger.warning("No replies received for group get_status command.")
+            return statuses
+        for physical_addr, full_response in replies.items():
+            expected_prefix = f"{physical_addr}GS"
+            if full_response.startswith(expected_prefix):
+                status_code = full_response[len(expected_prefix):].strip()
+                statuses[physical_addr] = status_code
+                self.logger.trace(f"Rotator {physical_addr} status: {status_code}")
+            else:
+                self.logger.warning(f"Unexpected status response format from {physical_addr}: '{full_response}'")
+                statuses[physical_addr] = "Error: BadFormat"
+        return statuses

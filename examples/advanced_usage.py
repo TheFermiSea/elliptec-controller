@@ -12,6 +12,7 @@ import signal
 import sys
 from contextlib import contextmanager
 from elliptec_controller import TripleRotatorController
+from loguru import logger
 
 
 class TimeoutError(Exception):
@@ -55,7 +56,7 @@ def sweep_polarization(controller, start_angles, end_angles, steps=10):
     try:
         # Check all rotators are ready
         if not controller.is_all_ready():
-            print("Not all rotators are ready. Homing first...")
+            logger.warning("Not all rotators are ready. Homing first...")
             controller.home_all(wait=True)
         
         # Calculate angle steps
@@ -64,7 +65,7 @@ def sweep_polarization(controller, start_angles, end_angles, steps=10):
             angle_steps.append((end_angles[i] - start_angles[i]) / steps)
         
         # Move to start position
-        print(f"Moving to start position: {start_angles}")
+        logger.info(f"Moving to start position: {start_angles}")
         controller.move_all_absolute(start_angles, wait=True)
         
         # Perform the sweep
@@ -73,17 +74,17 @@ def sweep_polarization(controller, start_angles, end_angles, steps=10):
                 start_angles[i] + angle_steps[i] * step 
                 for i in range(len(start_angles))
             ]
-            print(f"Step {step}/{steps}: Moving to {current_angles}")
+            logger.info(f"Step {step}/{steps}: Moving to {current_angles}")
             controller.move_all_absolute(current_angles, wait=True)
             
             # Perform your measurement here
-            print("Measuring...")
+            logger.info("Measuring...")
             time.sleep(0.5)  # Simulate a measurement
         
-        print("Sweep complete!")
+        logger.info("Sweep complete!")
     
     except Exception as e:
-        print(f"Error during sweep: {e}")
+        logger.error(f"Error during sweep: {e}", exc_info=True)
         return False
     
     return True
@@ -96,7 +97,11 @@ def advanced_demo(port_name="/dev/ttyUSB0"):
     Args:
         port_name: Serial port name
     """
-    print("=== Advanced Elliptec Controller Demo ===")
+    # Configure Loguru
+    logger.remove() # Remove default handler
+    logger.add(sys.stderr, level="INFO") # Set default level, can be overridden by environment or other config
+
+    logger.info("=== Advanced Elliptec Controller Demo ===")
     
     # Create controller with error handling
     controller = None
@@ -107,36 +112,37 @@ def advanced_demo(port_name="/dev/ttyUSB0"):
             names=["HWP1", "QWP", "HWP2"]
         )
     except Exception as e:
-        print(f"Failed to initialize controller: {e}")
+        logger.error(f"Failed to initialize controller: {e}", exc_info=True)
         return
     
     try:
         # Get device information
-        print("\n=== Device Information ===")
+        logger.info("\n=== Device Information ===")
         for i, rotator in enumerate(controller.rotators):
-            print(f"Rotator {i+1} ({rotator.name}):")
+            logger.info(f"Rotator {i+1} ({rotator.name}):")
             try:
                 with time_limit(3):  # Set timeout for device info request
-                    info = rotator.get_device_info(debug=True)
+                    # The debug flag is removed from get_device_info, logging is internal to the method
+                    info = rotator.get_device_info() 
                     for key, value in info.items():
-                        print(f"  {key}: {value}")
+                        logger.info(f"  {key}: {value}")
             except TimeoutError:
-                print("  Timed out while getting device info")
+                logger.warning("  Timed out while getting device info")
             except Exception as e:
-                print(f"  Error getting device info: {e}")
+                logger.error(f"  Error getting device info: {e}", exc_info=True)
         
         # Home all rotators with timeout protection
-        print("\n=== Homing Rotators ===")
+        logger.info("\n=== Homing Rotators ===")
         try:
             with time_limit(30):  # 30-second timeout for homing
                 result = controller.home_all(wait=True)
-                print(f"Homing result: {result}")
+                logger.info(f"Homing result: {result}")
         except TimeoutError:
-            print("Homing timed out. Stopping all rotators.")
+            logger.error("Homing timed out. Stopping all rotators.")
             controller.stop_all()
         
         # Perform a polarization sweep
-        print("\n=== Polarization Sweep ===")
+        logger.info("\n=== Polarization Sweep ===")
         start_angles = [0, 0, 0]      # All at 0 degrees
         end_angles = [90, 45, 90]     # Final positions
         sweep_result = sweep_polarization(
@@ -145,34 +151,34 @@ def advanced_demo(port_name="/dev/ttyUSB0"):
             end_angles, 
             steps=5
         )
-        print(f"Sweep completed successfully: {sweep_result}")
+        logger.info(f"Sweep completed successfully: {sweep_result}")
         
         # Demonstrate velocity control
-        print("\n=== Velocity Control ===")
-        print("Setting low velocity")
+        logger.info("\n=== Velocity Control ===")
+        logger.info("Setting low velocity")
         controller.set_all_velocities(20)
         
-        print("Moving with low velocity")
+        logger.info("Moving with low velocity")
         controller.move_all_absolute([45, 45, 45], wait=True)
         
-        print("Setting high velocity")
+        logger.info("Setting high velocity")
         controller.set_all_velocities(50)
         
-        print("Moving with high velocity")
+        logger.info("Moving with high velocity")
         controller.move_all_absolute([0, 0, 0], wait=True)
         
         # Clean up - return to home position
-        print("\n=== Cleanup ===")
+        logger.info("\n=== Cleanup ===")
         controller.home_all(wait=True)
     
     except Exception as e:
-        print(f"Demonstration error: {e}")
+        logger.error(f"Demonstration error: {e}", exc_info=True)
     
     finally:
         # Always close the controller
         if controller:
-            controller.close()
-            print("Controller closed")
+            controller.close() # Controller close method should handle internal rotator port closing.
+            logger.info("Controller closed")
 
 
 if __name__ == "__main__":

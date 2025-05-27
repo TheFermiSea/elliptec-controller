@@ -9,13 +9,14 @@ The base class for controlling a single Elliptec rotation stage.
 #### Constructor
 
 ```python
-ElliptecRotator(port, motor_address, name=None, debug=False)
+ElliptecRotator(port, motor_address, name=None, auto_home=True)
 ```
 
 - `port`: Serial port name (e.g., `/dev/ttyUSB0`, `COM3`), an open `pyserial.Serial` object, or a compatible mock object for testing. If a port name is given, the class handles opening and closing.
 - `motor_address`: Integer address of the rotator (0-15, represented as hex 0-F).
 - `name`: Optional string identifier for the rotator.
-- `debug`: Boolean, enables detailed debug output if True.
+- `auto_home`: Boolean, if True (default), the rotator will attempt to retrieve device info and home itself during initialization. Set to False if you want to manage these steps manually or if the device might not be immediately ready.
+- **Logging**: This class uses the `loguru` library for logging. The `debug` parameter has been removed. To see detailed logs, configure `loguru` in your application (e.g., `from loguru import logger; import sys; logger.add(sys.stderr, level="DEBUG")`).
 
 #### Key Attributes
 
@@ -28,12 +29,11 @@ ElliptecRotator(port, motor_address, name=None, debug=False)
 
 #### Methods
 
-##### `send_command(command, data=None, debug=False, timeout=None, send_addr_override=None, expect_reply_from_addr=None, timeout_multiplier=1.0) -> str`
-Send a command to the rotator and return the response. Handles low-level communication, address formatting, response checking, and timeouts.
+##### `send_command(command, data=None, timeout=None, send_addr_override=None, expect_reply_from_addr=None, timeout_multiplier=1.0) -> str`
+Send a command to the rotator and return the response. Handles low-level communication, address formatting, response checking, and timeouts. Logging is handled by `loguru`.
 
 - `command` (str): Command string (e.g., "gs", "ma", "sv").
 - `data` (str, optional): Optional data string to send with command.
-- `debug` (bool): Enable detailed debug output.
 - `timeout` (float, optional): Specific timeout in seconds for this command read. Overrides default logic.
 - `send_addr_override` (str, optional): Send the command using this address prefix instead of `self.active_address`.
 - `expect_reply_from_addr` (str, optional): Expect the response to start with this address prefix instead of `self.active_address`.
@@ -66,11 +66,10 @@ Set rotation velocity.
 - `velocity`: Integer 0-63
 - Returns: True if successful
 
-##### `move_absolute(degrees, wait=True, debug=False) -> bool`
+##### `move_absolute(degrees, wait=True) -> bool`
 Move to absolute position in degrees.
 - `degrees` (float): Target position in degrees (0-360).
 - `wait` (bool): Wait for movement completion if True.
-- `debug` (bool): Enable debug output for this operation.
 - Returns (bool): True if the move command was sent successfully (and completed, if `wait=True`). Applies `group_offset_degrees` automatically if set.
 
 ##### `move_relative(degrees, wait=True) -> bool`
@@ -79,28 +78,24 @@ Move by a relative amount in degrees.
 - `wait` (bool): Wait for completion if True.
 - Returns (bool): True if successful. Note: Internally uses `move_absolute` based on current position; offset logic applies if grouped.
 
-##### `get_device_info(debug=False) -> dict`
-Get detailed device information (serial, firmware, pulse count, etc.) by sending the "in" command. Populates `self.device_info` and `self.pulse_per_revolution`. Called automatically during initialization if a port name is provided.
-- `debug` (bool): Enable debug output.
+##### `get_device_info() -> dict`
+Get detailed device information (serial, firmware, pulse count, etc.) by sending the "in" command. Populates `self.device_info` and `self.pulse_per_revolution`. Called automatically during initialization if `auto_home=True` (default) and a port name is provided.
 - Returns (dict): Dictionary of device information.
 
-##### `configure_as_group_slave(master_address_to_listen_to, slave_offset=0.0, debug=False) -> bool`
+##### `configure_as_group_slave(master_address_to_listen_to, slave_offset=0.0) -> bool`
 Instruct this rotator (slave) to listen to a different `master_address` for synchronized movement. Sends the "ga" command.
 - `master_address_to_listen_to` (str): The address (0-F) this rotator should listen to.
 - `slave_offset` (float): Angular offset (degrees) for this slave relative to the group target. Stored in `group_offset_degrees`.
-- `debug` (bool): Enable debug output.
 - Returns (bool): True if configuration was successful (correct response received). Sets `is_slave_in_group` to True and `active_address` to `master_address_to_listen_to`.
 
-##### `revert_from_group_slave(debug=False) -> bool`
+##### `revert_from_group_slave() -> bool`
 Revert this rotator from slave mode back to its `physical_address`. Sends the "ga" command.
-- `debug` (bool): Enable debug output.
 - Returns (bool): True if reversion was successful. Resets `is_slave_in_group`, `active_address`, and `group_offset_degrees`.
 
-##### `continuous_move(direction, start=True, debug=False) -> bool`
+##### `continuous_move(direction, start=True) -> bool`
 Start or stop continuous movement using "fw" or "bw" commands.
 - `direction` (str): Direction ("fw" for forward, "bw" for backward).
 - `start` (bool): True to start movement, False to stop (by sending the "st" command).
-- `debug` (bool): Enable debug output.
 - Returns (bool): True if the command was sent successfully.
 
 ##### `optimize_motors(wait=True) -> bool`

@@ -6,6 +6,7 @@ This package provides classes and utilities for controlling Thorlabs Elliptec ro
 
 from .controller import (
     ElliptecRotator,
+    ElliptecGroupController, # Added
     # TripleRotatorController, # Removed
     degrees_to_hex,
     hex_to_degrees,
@@ -30,6 +31,7 @@ from .controller import (
 
 __all__ = [
     "ElliptecRotator",
+    "ElliptecGroupController", # Added
     # "TripleRotatorController", # Removed
     "degrees_to_hex",
     "hex_to_degrees",

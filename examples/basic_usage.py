@@ -8,74 +8,83 @@ Demonstrates connecting to a single rotator, homing, moving, and getting status.
 import serial
 from elliptec_controller import ElliptecRotator
 import time
+from loguru import logger
+import sys
 
 # Configuration
 SERIAL_PORT = "/dev/ttyUSB0"  # <-- IMPORTANT: Replace with your serial port name
 MOTOR_ADDRESS = 1           # <-- IMPORTANT: Replace with your device's address (0-F)
 
+# Configure Loguru for detailed output
+logger.remove() # Removes the default handler to avoid duplicate outputs if already configured
+logger.add(sys.stderr, level="DEBUG") # Change level to "TRACE" for most verbose, or "INFO" for less
+
 # Using a specific serial port
 try:
-    print(f"Connecting to rotator at address {MOTOR_ADDRESS} on port {SERIAL_PORT}...")
+    logger.info(f"Connecting to rotator at address {MOTOR_ADDRESS} on port {SERIAL_PORT}...")
     # Create a rotator instance - this opens the port and gets device info
     rotator1 = ElliptecRotator(
         port=SERIAL_PORT,
         motor_address=MOTOR_ADDRESS,
-        name=f"Rotator-{MOTOR_ADDRESS}",
-        debug=True           # Enable debug output for detailed info
+        name=f"Rotator-{MOTOR_ADDRESS}"
     )
 
-    # Print device info (retrieved during initialization)
-    print("\n--- Device Information ---")
-    if rotator1.device_info and rotator1.device_info.get("type") != "Unknown":
-        print(f"  Device Info: {rotator1.device_info}")
-        print(f"  Pulses per Revolution: {rotator1.pulse_per_revolution}")
+    # Log device info (retrieved during initialization if auto_home=True)
+    logger.info("\n--- Device Information ---")
+    if rotator1.device_info and rotator1.device_info.get("type") not in ["Unknown", "Error"]:
+        logger.info(f"  Device Info: {rotator1.device_info}")
+        logger.info(f"  Pulses per Revolution: {rotator1.pulse_per_revolution}")
     else:
-        print("  Could not retrieve valid device info.")
+        logger.warning("  Could not retrieve valid device info.")
         # Optionally raise an error or exit if info is critical
         # raise ConnectionError("Failed to get device info")
 
     # Home the rotator
-    print("\n--- Homing ---")
-    print("Homing...")
+    logger.info("\n--- Homing ---")
+    logger.info("Homing...")
     if rotator1.home(wait=True):
-        print("Homing complete.")
+        logger.info("Homing complete.")
     else:
-        print("Homing failed.")
+        logger.error("Homing failed.")
     time.sleep(1)
 
     # Move to an absolute position (in degrees)
     target_pos = 90.0
-    print(f"\n--- Moving to {target_pos} degrees ---")
+    logger.info(f"\n--- Moving to {target_pos} degrees ---")
     if rotator1.move_absolute(target_pos, wait=True):
-        print("Move complete.")
+        logger.info("Move complete.")
     else:
-        print("Move failed.")
+        logger.error("Move failed.")
     time.sleep(1)
 
     # Get the current position
-    print("\n--- Checking Position ---")
-    position = rotator1.update_position(debug=True)
-    print(f"Current reported position: {position:.2f} degrees")
+    logger.info("\n--- Checking Position ---")
+    position = rotator1.update_position() # debug flag removed
+    if position is not None:
+        logger.info(f"Current reported position: {position:.2f} degrees")
+    else:
+        logger.warning("Failed to get current position.")
+
 
     # Example of getting status code
-    status_code = rotator1.get_status(debug=True)
-    print(f"Current status code: {status_code} (00 means OK/Ready)")
+    status_code = rotator1.get_status() # debug flag removed
+    logger.info(f"Current status code: {status_code} (00 means OK/Ready)")
 
-    print("\nBasic usage example finished.")
+    logger.info("\nBasic usage example finished.")
 
 except serial.SerialException as e:
-    print(f"\n--- Serial Port Error ---")
-    print(f"Could not open or communicate on port '{SERIAL_PORT}'.")
-    print(f"Error details: {e}")
-    print("Please check if the port name is correct and the device is connected.")
+    logger.error(f"\n--- Serial Port Error ---")
+    logger.error(f"Could not open or communicate on port '{SERIAL_PORT}'.")
+    logger.error(f"Error details: {e}")
+    logger.error("Please check if the port name is correct and the device is connected.")
 except Exception as e:
-    print(f"\n--- An Error Occurred ---")
-    print(f"Error details: {e}")
+    logger.error(f"\n--- An Error Occurred ---", exc_info=True)
+
 
 finally:
     # The ElliptecRotator class handles closing the serial port implicitly
     # when the object is destroyed if it opened the port itself (by passing a string name).
     # No explicit close call is needed here in that case.
-    print("\nCleanup: Port will be closed automatically if opened by the class.")
+    logger.info("\nCleanup: Port (if opened by class) will be closed automatically by ElliptecRotator destructor.")
 
 ```

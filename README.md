@@ -39,8 +39,9 @@ try:
     rotator1 = ElliptecRotator(
         port="/dev/ttyUSB0",  # Replace with your serial port
         motor_address=1,      # Replace with your device address (0-F)
-        name="Rotator1",
-        debug=True           # Enable debug output
+        name="Rotator1"
+        # Logging is now handled by Loguru.
+        # Configure Loguru in your application to see detailed logs.
     )
 
     # Print device info (retrieved during initialization)
@@ -91,15 +92,15 @@ try:
     # Use context managers for reliable port handling if sharing a port manually
     # If passing port name to ElliptecRotator, it handles opening/closing.
     # Here, we instantiate them separately.
-    master_rot = ElliptecRotator(SERIAL_PORT, MASTER_ADDR, "Master", debug=True)
-    slave_rot = ElliptecRotator(SERIAL_PORT, SLAVE_ADDR, "Slave", debug=True)
+    master_rot = ElliptecRotator(SERIAL_PORT, MASTER_ADDR, "Master")
+    slave_rot = ElliptecRotator(SERIAL_PORT, SLAVE_ADDR, "Slave")
 
     # --- Synchronization Setup ---
     slave_offset_deg = 30.0  # Slave will move to (target + 30 degrees)
     master_offset_deg = 0.0  # Master moves to target directly
 
     print(f"Configuring Slave (Addr {slave_rot.physical_address}) to listen to Master (Addr {master_rot.physical_address}) with {slave_offset_deg} deg offset...")
-    if slave_rot.configure_as_group_slave(master_rot.physical_address, slave_offset_deg, debug=True):
+    if slave_rot.configure_as_group_slave(master_rot.physical_address, slave_offset_deg):
         print("Slave configured successfully.")
         # Optionally set an offset for the master itself for the group move
         master_rot.group_offset_degrees = master_offset_deg
@@ -112,15 +113,15 @@ try:
     print(f"Sending synchronized move command to Master address {master_rot.physical_address} for logical target {target_angle} deg...")
     # Command is sent to master_rot's address. Both master and slave (listening on master's addr) will react.
     # Each applies its own offset internally.
-    if master_rot.move_absolute(target_angle, wait=True, debug=True):
+    if master_rot.move_absolute(target_angle, wait=True):
         print("Synchronized move command sent and completed.")
     else:
         print("Synchronized move failed.")
 
     time.sleep(1)
     # Verify positions (update_position handles offset adjustment for slaves)
-    master_pos = master_rot.update_position(debug=True)
-    slave_pos_logical = slave_rot.update_position(debug=True) # update_position returns the logical position for a slave
+    master_pos = master_rot.update_position()
+    slave_pos_logical = slave_rot.update_position() # update_position returns the logical position for a slave
     print(f"Master final position: {master_pos:.2f} deg (Expected physical: {target_angle + master_offset_deg:.2f})")
     # Note: Slave's *physical* position would be target_angle + slave_offset_deg
     # update_position for a slave returns the logical position (physical - offset)
@@ -129,7 +130,7 @@ try:
 
     # --- Revert Synchronization ---
     print("Reverting slave from group mode...")
-    if slave_rot.revert_from_group_slave(debug=True):
+    if slave_rot.revert_from_group_slave():
         print("Slave reverted successfully.")
     else:
         print("Failed to revert slave.")
@@ -152,6 +153,18 @@ finally:
 ## Documentation
 
 For detailed documentation on all available commands and features, please refer to the [Thorlabs Elliptec documentation](https://www.thorlabs.com/newgrouppage9.cfm?objectgroup_id=9252) and the docstrings within the code.
+
+## Logging
+
+This package uses the [Loguru](https://loguru.readthedocs.io/en/stable/) library for logging.
+- The `ElliptecRotator` class no longer uses a `debug` parameter.
+- To see detailed logs (DEBUG, TRACE levels) from the controller, you need to configure Loguru in your application. For example:
+  ```python
+  from loguru import logger
+  import sys
+  logger.add(sys.stderr, level="TRACE") 
+  ```
+- Consult the Loguru documentation for advanced configuration options (e.g., writing to files, custom formats).
 
 ## Testing
 

@@ -128,7 +128,7 @@ def mock_serial_port():
 def rotator_addr_1(mock_serial_port):
     """Provide an ElliptecRotator instance using the mock serial port at address '1'."""
     # Initialization with a mock port object will not call get_device_info automatically.
-    rot = ElliptecRotator(mock_serial_port, motor_address=1, name="Rotator-1", debug=False)
+    rot = ElliptecRotator(mock_serial_port, motor_address=1, name="Rotator-1")
     # Manually set pulse count and other relevant state often set by get_device_info
     # Using value from user's device example for realistic calculations
     rot.pulse_per_revolution = 143360
@@ -144,7 +144,7 @@ def rotator_addr_1(mock_serial_port):
 @pytest.fixture
 def rotator_addr_8(mock_serial_port):
     """Provide an ElliptecRotator instance using the mock serial port at address '8'."""
-    rot = ElliptecRotator(mock_serial_port, motor_address=8, name="Rotator-8", debug=False)
+    rot = ElliptecRotator(mock_serial_port, motor_address=8, name="Rotator-8")
     # Manually set pulse count, mirroring rotator_addr_1 for consistency in tests
     rot.pulse_per_revolution = 143360
     rot.pulses_per_deg = rot.pulse_per_revolution / 360.0
@@ -208,14 +208,41 @@ def test_rotator_init_with_mock(rotator_addr_1, mock_serial_port):
 
 @patch('elliptec_controller.controller.serial.Serial')
 def test_rotator_init_with_string(mock_serial_class):
-    """Test initializing with a port string, checking internal calls."""
+    """Test initializing with a port string, checking internal calls and auto-home sequence."""
     mock_serial_instance = MagicMock()
     mock_serial_instance.is_open = True
     mock_serial_class.return_value = mock_serial_instance
 
-    # Create a patch that simply returns succesful device info
-    with patch.object(ElliptecRotator, 'get_device_info', return_value={'type': '0E', 'pulses_per_unit_dec': '143360'}):
-        rot = ElliptecRotator(port="/dev/mock", motor_address=2, name="StringInit", debug=False)
+    # Define the actual logic for the get_device_info mock's side effect
+    def actual_get_device_info_logic(self_rot_instance):
+        # 'self_rot_instance' is the ElliptecRotator instance on which get_device_info is called
+        pulses_val = 143360
+        # This side effect simulates the real get_device_info's impact on these attributes
+        # AND the __init__ method's logic also tries to set these from the return value.
+        self_rot_instance.pulse_per_revolution = pulses_val
+        self_rot_instance.pulses_per_deg = pulses_val / 360.0
+        # Return a dictionary similar to what the real method would,
+        # including keys that __init__ itself might parse.
+        return {
+            'type': '0E', 
+            'pulses_per_unit_decimal': str(pulses_val),
+            'firmware_release_hex': 'dummyFW', 
+            'serial_number': 'dummySN'
+        }
+
+
+    
+    # Patch get_device_info using autospec,
+    # and patch the auto-home sequence methods.
+    # The auto_home parameter in ElliptecRotator.__init__ defaults to True.
+    with patch.object(ElliptecRotator, 'get_device_info', autospec=True) as mock_gdi, \
+         patch.object(ElliptecRotator, 'home', return_value=True) as mock_home, \
+         patch.object(ElliptecRotator, 'update_position') as mock_update_pos, \
+         patch.object(ElliptecRotator, 'get_velocity', return_value=60) as mock_get_vel, \
+         patch.object(ElliptecRotator, 'get_jog_step', return_value=1.0) as mock_get_jog:
+            
+        mock_gdi.side_effect = actual_get_device_info_logic # Assign side_effect here
+        rot = ElliptecRotator(port="/dev/mock", motor_address=2, name="StringInit", auto_home=True)
 
     mock_serial_class.assert_called_once_with(
         port="/dev/mock", baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1
@@ -223,7 +250,20 @@ def test_rotator_init_with_string(mock_serial_class):
     # Verify the serial port was passed correctly
     assert rot.serial == mock_serial_instance
     assert rot.physical_address == '2'
-    assert rot.pulse_per_revolution == 143360 # Should be set by get_device_info
+    # Verify pulse_per_revolution is set correctly by __init__ logic based on mocked get_device_info
+    assert rot.pulse_per_revolution == 143360 
+    
+    # Assert that get_device_info mock was called during __init__
+    mock_gdi.assert_called_once()
+
+    # Assert that auto-home sequence methods were called because auto_home=True
+    mock_home.assert_called_once()
+    # update_position is called by __init__ after home sequence.
+    # If home(wait=True) itself calls update_position, call_count might be >1.
+    # For this test, ensuring it's called at least by __init__'s main path is key.
+    assert mock_update_pos.call_count >= 1 
+    mock_get_vel.assert_called_once()
+    mock_get_jog.assert_called_once()
     # Skip position and other state checks as they may not be set at init
     assert rot._jog_step_size == 1.0 # Default jog step size
     assert rot.velocity == 60 # Default velocity
@@ -336,11 +376,14 @@ def test_home(rotator_addr_1, mock_serial_port):
     # Homing sends 'ho0', might get 'GS09' (moving) or 'PO...'
     mock_serial_port.set_response("1ho0", b"1GS09\r\n") # Acknowledge, moving
     # We patch wait_until_ready to simulate completion
-    with patch.object(rotator_addr_1, 'wait_until_ready', return_value=True) as mock_wait:
+    with patch.object(rotator_addr_1, 'wait_until_ready', return_value=True) as mock_wait, \
+         patch.object(rotator_addr_1, 'update_position', return_value=0.0) as mock_update: # Mock update_position
         result = rotator_addr_1.home(wait=True)
-        assert mock_serial_port.log[-1] == b"1ho0\\r"
+        # Check if the home command is in the log (it might not be the absolute last one if update_position is called)
+        assert b"1ho0\\r" in [log_item.replace(b'\\\\',b'\\') for log_item in mock_serial_port.log]
         assert result is True
         mock_wait.assert_called_once()
+        mock_update.assert_called_once() # Ensure update_position was called
         # Homing should update position to 0
         assert rotator_addr_1.position_degrees == 0.0
 
@@ -360,11 +403,14 @@ def test_move_absolute(rotator_addr_1, mock_serial_port):
     cmd_str = f"1ma{expected_hex}"
     mock_serial_port.set_response(cmd_str, b"1GS09\r\n") # Acknowledge, moving
 
-    with patch.object(rotator_addr_1, 'wait_until_ready', return_value=True) as mock_wait:
+    with patch.object(rotator_addr_1, 'wait_until_ready', return_value=True) as mock_wait, \
+         patch.object(rotator_addr_1, 'update_position', return_value=target_deg) as mock_update: # Mock update_position
         result = rotator_addr_1.move_absolute(target_deg, wait=True)
-        assert mock_serial_port.log[-1] == f"{cmd_str}\\r".encode()
+        # Check if the move command is in the log
+        assert f"{cmd_str}\\r".encode() in [log_item.replace(b'\\\\',b'\\') for log_item in mock_serial_port.log]
         assert result is True
         mock_wait.assert_called_once()
+        mock_update.assert_called_once() # Ensure update_position was called
         # Set position manually since we're mocking wait_until_ready
         rotator_addr_1.position_degrees = target_deg
         # Check if position state was updated
@@ -461,19 +507,25 @@ def test_get_device_info(rotator_addr_8, mock_serial_port):
     info_str = "0E1140060920231701016800023000"
     mock_serial_port.set_response("8in", f"8IN{info_str}\r\n".encode())
 
-    info = rotator_addr_8.get_device_info(debug=True)
+    info = rotator_addr_8.get_device_info()
 
     assert mock_serial_port.log[-1] == b"8in\\r"
     assert info is not None
-    assert info.get("type") == "0E"
-    assert info.get("firmware") == "1140"
-    assert info.get("serial_number") == "06092023"
-    assert info.get("year_month") == "1701"
-    assert info.get("day_batch") == "01"
-    assert info.get("hardware") == "6800"
-    assert info.get("max_range") == "023000"
-    assert info.get("pulses_per_unit") == "023000"
-    assert info.get("pulses_per_unit_dec") == "143360"
+    assert info.get("device_type_hex") == "0E" # Corrected key
+    assert info.get("firmware_release_hex") == "1140" # Corrected key
+    assert info.get("serial_number") == "0609"
+    assert info.get("year_of_manufacture") == "2023"
+    assert info.get("day_of_manufacture_hex") == "17"
+    assert info.get("day_of_manufacture_decimal") == str(int("17", 16)) # Should be "23"
+    assert info.get("hardware_release_hex") == "01"
+    # Also check parsed hardware details based on "01"
+    assert info.get("hardware_thread_type") == "Metric" # 0x01 & 0x80 is false
+    assert info.get("hardware_release_number") == str(int("01", 16) & 0x7F) # Should be "1"
+    assert "Metric, Release 1" in info.get("hardware_formatted")
+    assert info.get("travel_hex") == "0168"
+    assert info.get("travel_decimal") == str(int("0168", 16)) # Should be "360"
+    assert info.get("pulses_per_unit_hex") == "00023000"
+    assert info.get("pulses_per_unit_decimal") == str(int("00023000", 16)) # Should be "143360"
     assert "firmware_formatted" in info
     assert "hardware_formatted" in info
     
@@ -488,11 +540,11 @@ def test_rotator_specific_pulse_counts():
     mock_port = MockSerial()
     
     # Create two rotators with different pulse counts
-    rotator1 = ElliptecRotator(mock_port, motor_address=2, name="Rotator-2", debug=False, auto_home=False)
+    rotator1 = ElliptecRotator(mock_port, motor_address=2, name="Rotator-2", auto_home=False)
     rotator1.pulse_per_revolution = 262144  # Default value for ELL14/ELL18
     rotator1.pulses_per_deg = rotator1.pulse_per_revolution / 360.0
     
-    rotator2 = ElliptecRotator(mock_port, motor_address=3, name="Rotator-3", debug=False, auto_home=False)
+    rotator2 = ElliptecRotator(mock_port, motor_address=3, name="Rotator-3", auto_home=False)
     rotator2.pulse_per_revolution = 143360  # Custom value as in our tests
     rotator2.pulses_per_deg = rotator2.pulse_per_revolution / 360.0
     
@@ -549,8 +601,8 @@ def test_rotator_specific_pulse_counts():
          patch.object(rotator2, 'send_command', return_value=f"3PO{pos_hex2}") as mock_send2:
         
         # Get positions
-        pos1 = rotator1.update_position(debug=True)
-        pos2 = rotator2.update_position(debug=True)
+        pos1 = rotator1.update_position()
+        pos2 = rotator2.update_position()
         
         # Both should return approximately 90 degrees despite different pulse counts
         assert pos1 == pytest.approx(90.0, abs=1e-2)
@@ -563,8 +615,8 @@ def test_rotator_specific_pulse_counts():
     with patch.object(rotator1, 'send_command', return_value=f"2PO{pos_hex2}") as mock_send1, \
          patch.object(rotator2, 'send_command', return_value=f"3PO{pos_hex1}") as mock_send2:
         
-        wrong_pos1 = rotator1.update_position(debug=True)
-        wrong_pos2 = rotator2.update_position(debug=True)
+        wrong_pos1 = rotator1.update_position()
+        wrong_pos2 = rotator2.update_position()
         
         # Hex values were swapped, so rotator1 should get ~164.6° and rotator2 should get ~49.2°
         # (due to the different pulse counts: 262144 vs 143360)

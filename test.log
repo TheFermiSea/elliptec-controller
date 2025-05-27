@@ -1,0 +1,861 @@
+============================= test session starts ==============================
+platform linux -- Python 3.13.3, pytest-8.3.5, pluggy-1.6.0
+rootdir: /home/maitai/Documents/elliptec-controller
+configfile: pyproject.toml
+testpaths: tests
+collected 51 items
+
+tests/test_controller.py .......................                         [ 45%]
+tests/test_group_controller.py .........FFFFFFF..FFFFFFFFFF              [100%]
+
+=================================== FAILURES ===================================
+__________________ test_disband_group_one_slave_fails_revert ___________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b75250>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75050>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b74e50>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75150>
+
+    def test_disband_group_one_slave_fails_revert(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test disbanding when one slave fails to revert."""
+        def configure_slave_side_effect(rotator_instance, master_addr, slave_offset=0.0):
+            rotator_instance.active_address = master_addr
+            rotator_instance.is_slave_in_group = True
+            return True
+    
+        def revert_g2_success_side_effect():
+            rotator_g2.active_address = rotator_g2.physical_address
+            rotator_g2.is_slave_in_group = False
+            return True
+    
+        # g3's revert_from_group_slave will be mocked to just return False
+        with patch.object(rotator_g2, 'configure_as_group_slave', side_effect=lambda *args, **kwargs: configure_slave_side_effect(rotator_g2, *args, **kwargs)), \
+             patch.object(rotator_g3, 'configure_as_group_slave', side_effect=lambda *args, **kwargs: configure_slave_side_effect(rotator_g3, *args, **kwargs)):
+               group_controller.form_group()
+    
+        with patch.object(rotator_g2, 'revert_from_group_slave', side_effect=revert_g2_success_side_effect) as mock_revert_g2, \
+             patch.object(rotator_g3, 'revert_from_group_slave', return_value=False) as mock_revert_g3: # g3 fails
+    
+            assert group_controller.disband_group() is False # Overall disband should report failure
+            assert group_controller.is_grouped is False # State should still be reset
+    
+            mock_revert_g2.assert_called_once()
+            mock_revert_g3.assert_called_once()
+    
+            # g2 should have reverted
+            assert rotator_g2.active_address == rotator_g2.physical_address
+            assert rotator_g2.is_slave_in_group is False
+    
+            # For g3, which failed to revert its own state via its (mocked) method:
+            # The ElliptecGroupController.disband_group itself will forcefully reset the
+            # active_address and is_slave_in_group attributes on the rotator *object*
+            # it holds, even if the physical device didn't confirm.
+            # Actually, disband_group relies on revert_from_group_slave to change state.
+            # If revert_from_group_slave (mocked here to return False and not change state) fails,
+            # g3's active_address should remain the group_address (master's physical address).
+            assert rotator_g3.active_address == rotator_g1.physical_address # Group address
+>           assert rotator_g3.is_slave_in_group is False
+E           assert True is False
+E            +  where True = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75150>.is_slave_in_group
+
+tests/test_group_controller.py:255: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:01:31.242 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:01:31.242 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:01:31.242 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:01:31.242 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:01:31.242 | INFO     | elliptec_controller.controller:form_group:688 - Group successfully formed. Master address: 1
+2025-05-26 15:01:31.242 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:01:31.242 | DEBUG    | elliptec_controller.controller:disband_group:702 - Reverting slave GroupSlave-2 (Current Active: 1) to physical 2
+2025-05-26 15:01:31.242 | DEBUG    | elliptec_controller.controller:disband_group:702 - Reverting slave GroupSlave-3 (Current Active: 1) to physical 3
+2025-05-26 15:01:31.243 | ERROR    | elliptec_controller.controller:disband_group:704 - Failed to revert slave GroupSlave-3
+2025-05-26 15:01:31.243 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:01:31.243 | WARNING  | elliptec_controller.controller:disband_group:716 - Group disbandment encountered errors for some slaves.
+_________________________ test_home_group_success_wait _________________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf55994f2f0>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b74d50>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b74c50>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b74b50>
+
+    def test_home_group_success_wait(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test home_group with wait=True and all rotators succeed."""
+    
+        # This helper will be the side_effect for configure_as_group_slave.
+        # autospec=True on the patch ensures it gets 'self_instance' as its first argument.
+        def actual_configure_slave_logic(self_slave_instance, master_address_char, slave_offset=0.0):
+            self_slave_instance.active_address = master_address_char
+            self_slave_instance.is_slave_in_group = True
+            self_slave_instance.group_offset_degrees = slave_offset
+            # self_slave_instance.logger.info(f"mock: {self_slave_instance.name} configured for group {master_address_char}")
+            return True
+    
+        # Patch configure_as_group_slave for the slave rotators (g2, g3) to ensure form_group succeeds
+        with patch.object(rotator_g2, 'configure_as_group_slave', autospec=True) as mock_config_g2, \
+             patch.object(rotator_g3, 'configure_as_group_slave', autospec=True) as mock_config_g3:
+    
+            mock_config_g2.side_effect = actual_configure_slave_logic
+            mock_config_g3.side_effect = actual_configure_slave_logic
+    
+            # Call form_group and assert its success
+>           assert group_controller.form_group() is True, "form_group should succeed with mocked slave configurations"
+
+tests/test_group_controller.py:280: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+elliptec_controller/controller.py:680: in form_group
+    if not slave.configure_as_group_slave(self.group_master_address_char, slave_offset=0.0):
+<string>:3: in configure_as_group_slave
+    ???
+.pixi/envs/default/lib/python3.13/unittest/mock.py:1169: in __call__
+    return self._mock_call(*args, **kwargs)
+.pixi/envs/default/lib/python3.13/unittest/mock.py:1173: in _mock_call
+    return self._execute_mock_call(*args, **kwargs)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <MagicMock name='configure_as_group_slave' spec='method' id='136293695167792'>
+args = ('1',), kwargs = {'slave_offset': 0.0}
+effect = <function test_home_group_success_wait.<locals>.actual_configure_slave_logic at 0x7bf5594d3420>
+
+    def _execute_mock_call(self, /, *args, **kwargs):
+        # separate from _increment_mock_call so that awaited functions are
+        # executed separately from their call, also AsyncMock overrides this method
+    
+        effect = self.side_effect
+        if effect is not None:
+            if _is_exception(effect):
+                raise effect
+            elif not _callable(effect):
+                result = next(effect)
+                if _is_exception(result):
+                    raise result
+            else:
+>               result = effect(*args, **kwargs)
+E               TypeError: test_home_group_success_wait.<locals>.actual_configure_slave_logic() missing 1 required positional argument: 'master_address_char'
+
+.pixi/envs/default/lib/python3.13/unittest/mock.py:1234: TypeError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:01:31.262 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:01:31.264 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:01:31.264 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+_______________________ test_home_group_success_no_wait ________________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf55994f890>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75a50>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75c50>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75350>
+
+    def test_home_group_success_no_wait(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test home_group with wait=False and command dispatched."""
+        group_controller.form_group()
+        mock_replies = {rotator_g1.physical_address: f"{rotator_g1.physical_address}GS09"} # At least one reply
+    
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value=mock_replies) as mock_send_group, \
+             patch.object(ElliptecRotator, 'wait_until_ready') as mock_wait: # General patch, should not be called
+    
+>           assert group_controller.home_group(wait=False) is True
+E           assert False is True
+E            +  where False = home_group(wait=False)
+E            +    where home_group = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf55994f890>.home_group
+
+tests/test_group_controller.py:323: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:01:31.336 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:01:31.336 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:01:31.336 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:01:31.336 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:33.642 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:33.643 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:33.643 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:01:33.643 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:01:33.643 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:35.949 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:35.949 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:35.949 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:01:35.949 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:01:35.949 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:01:35.949 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:01:35.949 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:01:35.950 | ERROR    | elliptec_controller.controller:home_group:792 - Cannot home group: Group not formed or master address not set.
+____________________ test_home_group_fail_one_rotator_wait _____________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf559476350>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75d50>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75e50>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75f50>
+
+    def test_home_group_fail_one_rotator_wait(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test home_group with wait=True where one rotator fails to become ready."""
+        group_controller.form_group()
+        mock_replies = {
+            rotator_g1.physical_address: f"{rotator_g1.physical_address}GS09",
+            rotator_g2.physical_address: f"{rotator_g2.physical_address}GS09",
+            rotator_g3.physical_address: f"{rotator_g3.physical_address}GS09"
+        }
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value=mock_replies), \
+             patch.object(rotator_g1, 'wait_until_ready', return_value=True), \
+             patch.object(rotator_g2, 'wait_until_ready', return_value=False) as mock_wait_g2, \
+             patch.object(rotator_g3, 'wait_until_ready', return_value=True): # g3 might not be called if g2 fails first
+    
+            assert group_controller.home_group(wait=True, home_timeout_per_rotator=0.1) is False
+>           mock_wait_g2.assert_called_once() # Ensure it was attempted
+
+tests/test_group_controller.py:341: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <MagicMock name='wait_until_ready' id='136293695168800'>
+
+    def assert_called_once(self):
+        """assert that the mock was called only once.
+        """
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to have been called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected 'wait_until_ready' to have been called once. Called 0 times.
+
+.pixi/envs/default/lib/python3.13/unittest/mock.py:958: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:01:35.958 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:01:35.958 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:01:35.958 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:01:35.958 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:38.264 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:38.264 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:38.264 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:01:38.264 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:01:38.264 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:40.571 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:40.571 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:40.571 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:01:40.571 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:01:40.571 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:01:40.571 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:01:40.571 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:01:40.571 | ERROR    | elliptec_controller.controller:home_group:792 - Cannot home group: Group not formed or master address not set.
+___________________ test_home_group_no_initial_replies_wait ____________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf5599f8210>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75450>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b74950>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75350>
+
+    def test_home_group_no_initial_replies_wait(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test home_group with wait=True but no initial replies from _send_group_command_and_collect_replies."""
+        group_controller.form_group()
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value={}) as mock_send_group, \
+             patch.object(rotator_g1, 'wait_until_ready', return_value=True) as mock_wait_g1, \
+             patch.object(rotator_g2, 'wait_until_ready', return_value=True) as mock_wait_g2, \
+             patch.object(rotator_g3, 'wait_until_ready', return_value=True) as mock_wait_g3:
+            # Even with no initial ACKs, if wait=True, it proceeds to wait for readiness.
+            # The success then depends on wait_until_ready.
+>           assert group_controller.home_group(wait=True) is True
+E           assert False is True
+E            +  where False = home_group(wait=True)
+E            +    where home_group = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf5599f8210>.home_group
+
+tests/test_group_controller.py:352: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:01:40.607 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:01:40.607 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:01:40.607 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:01:40.607 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:42.913 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:42.914 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:42.914 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:01:42.914 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:01:42.914 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:45.220 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:45.221 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:45.221 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:01:45.221 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:01:45.221 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:01:45.221 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:01:45.221 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:01:45.221 | ERROR    | elliptec_controller.controller:home_group:792 - Cannot home group: Group not formed or master address not set.
+__________________ test_home_group_no_initial_replies_no_wait __________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b5fd40>
+
+    def test_home_group_no_initial_replies_no_wait(group_controller):
+        """Test home_group with wait=False and no initial replies."""
+        group_controller.form_group()
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value={}) as mock_send_group:
+            assert group_controller.home_group(wait=False) is False # Fails as no ACK and not waiting
+>           mock_send_group.assert_called_once()
+
+tests/test_group_controller.py:364: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <MagicMock name='_send_group_command_and_collect_replies' id='136293700860768'>
+
+    def assert_called_once(self):
+        """assert that the mock was called only once.
+        """
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to have been called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected '_send_group_command_and_collect_replies' to have been called once. Called 0 times.
+
+.pixi/envs/default/lib/python3.13/unittest/mock.py:958: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:01:45.229 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:01:45.229 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:01:45.229 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:01:45.229 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:47.536 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:47.536 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:47.536 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:01:47.536 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:01:47.537 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:49.844 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:49.844 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:49.844 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:01:49.844 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:01:49.844 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:01:49.844 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:01:49.844 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:01:49.844 | ERROR    | elliptec_controller.controller:home_group:792 - Cannot home group: Group not formed or master address not set.
+___________________________ test_stop_group_success ____________________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf5588787d0>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b74350>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b74650>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b75250>
+
+    def test_stop_group_success(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test stop_group with all rotators acknowledging successfully."""
+        group_controller.form_group()
+        # Set rotators to moving state for the test
+        for r in [rotator_g1, rotator_g2, rotator_g3]:
+            r.is_moving = True
+    
+        mock_replies = {
+            rotator_g1.physical_address: f"{rotator_g1.physical_address}GS00",
+            rotator_g2.physical_address: f"{rotator_g2.physical_address}GS00",
+            rotator_g3.physical_address: f"{rotator_g3.physical_address}GS00"
+        }
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value=mock_replies) as mock_send_group:
+>           assert group_controller.stop_group() is True
+E           assert False is True
+E            +  where False = stop_group()
+E            +    where stop_group = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf5588787d0>.stop_group
+
+tests/test_group_controller.py:380: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:01:49.878 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:01:49.879 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:01:49.879 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:01:49.879 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:52.185 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:52.185 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:52.186 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:01:52.186 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:01:52.186 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:01:54.492 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:01:54.492 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:01:54.492 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:01:54.492 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:01:54.493 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:01:54.493 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:01:54.493 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:01:54.493 | ERROR    | elliptec_controller.controller:stop_group:829 - Cannot stop group: Group not formed or master address not set.
+__________________________ test_stop_group_no_replies __________________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf559a9e0d0>
+
+    def test_stop_group_no_replies(group_controller):
+        """Test stop_group when no rotators reply."""
+        group_controller.form_group()
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value={}) as mock_send_group:
+            assert group_controller.stop_group() is False
+>           mock_send_group.assert_called_once()
+
+tests/test_group_controller.py:419: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <MagicMock name='_send_group_command_and_collect_replies' id='136293695168464'>
+
+    def assert_called_once(self):
+        """assert that the mock was called only once.
+        """
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to have been called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected '_send_group_command_and_collect_replies' to have been called once. Called 0 times.
+
+.pixi/envs/default/lib/python3.13/unittest/mock.py:958: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:01.425 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:01.425 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:01.425 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:01.425 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:03.732 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:03.732 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:03.732 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:03.732 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:02:03.732 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:06.039 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:06.039 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:06.039 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:02:06.039 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:06.039 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:06.039 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:06.039 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:06.039 | ERROR    | elliptec_controller.controller:stop_group:829 - Cannot stop group: Group not formed or master address not set.
+____________________ test_move_group_absolute_success_wait _____________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf559429450>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b76850>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b76a50>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b76550>
+
+    def test_move_group_absolute_success_wait(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test move_group_absolute with wait=True and all rotators succeed."""
+        group_controller.form_group()
+        target_degrees = 45.0
+        hex_pos = degrees_to_hex(target_degrees, rotator_g1.pulse_per_revolution) # Assuming master's PPR for group cmd
+    
+        mock_replies = {
+            rotator_g1.physical_address: f"{rotator_g1.physical_address}GS09", # Moving
+            rotator_g2.physical_address: f"{rotator_g2.physical_address}GS09",
+            rotator_g3.physical_address: f"{rotator_g3.physical_address}GS09"
+        }
+    
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value=mock_replies) as mock_send_group, \
+             patch.object(rotator_g1, 'wait_until_ready', return_value=True) as mock_wait_g1, \
+             patch.object(rotator_g2, 'wait_until_ready', return_value=True) as mock_wait_g2, \
+             patch.object(rotator_g3, 'wait_until_ready', return_value=True) as mock_wait_g3, \
+             patch.object(rotator_g1, 'update_position') as mock_update_g1, \
+             patch.object(rotator_g2, 'update_position') as mock_update_g2, \
+             patch.object(rotator_g3, 'update_position') as mock_update_g3:
+    
+>           assert group_controller.move_group_absolute(target_degrees, wait=True) is True
+E           assert False is True
+E            +  where False = move_group_absolute(45.0, wait=True)
+E            +    where move_group_absolute = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf559429450>.move_group_absolute
+
+tests/test_group_controller.py:443: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:06.073 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:06.074 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:06.074 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:06.074 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:08.379 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:08.379 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:08.379 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:08.379 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:02:08.379 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:10.685 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:10.685 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:10.685 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:02:10.685 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:10.685 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:10.685 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:10.685 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:10.686 | ERROR    | elliptec_controller.controller:move_group_absolute:862 - Cannot move group: Group not formed, master address not set, or master rotator not identified.
+___________________ test_move_group_absolute_success_no_wait ___________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b672f0>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b76f50>
+
+    def test_move_group_absolute_success_no_wait(group_controller, rotator_g1):
+        """Test move_group_absolute with wait=False."""
+        group_controller.form_group()
+        target_degrees = 30.0
+        hex_pos = degrees_to_hex(target_degrees, rotator_g1.pulse_per_revolution)
+        mock_replies = {rotator_g1.physical_address: f"{rotator_g1.physical_address}GS09"}
+    
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value=mock_replies) as mock_send_group, \
+             patch.object(ElliptecRotator, 'wait_until_ready') as mock_wait:
+    
+>           assert group_controller.move_group_absolute(target_degrees, wait=False) is True
+E           assert False is True
+E            +  where False = move_group_absolute(30.0, wait=False)
+E            +    where move_group_absolute = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b672f0>.move_group_absolute
+
+tests/test_group_controller.py:465: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:10.694 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:10.694 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:10.694 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:10.694 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:13.000 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:13.000 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:13.000 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:13.000 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:02:13.000 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:15.307 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:15.307 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:15.307 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:02:15.307 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:15.307 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:15.307 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:15.307 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:15.308 | ERROR    | elliptec_controller.controller:move_group_absolute:862 - Cannot move group: Group not formed, master address not set, or master rotator not identified.
+____________________ test_move_group_absolute_fail_one_wait ____________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b67bf0>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b77950>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b77a50>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b77b50>
+
+    def test_move_group_absolute_fail_one_wait(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test move_group_absolute with wait=True, one rotator fails wait_until_ready."""
+        group_controller.form_group()
+        target_degrees = 60.0
+        hex_pos = degrees_to_hex(target_degrees, rotator_g1.pulse_per_revolution)
+        mock_replies = {r.physical_address: f"{r.physical_address}GS09" for r in group_controller.rotators}
+    
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value=mock_replies), \
+             patch.object(rotator_g1, 'wait_until_ready', return_value=True), \
+             patch.object(rotator_g2, 'wait_until_ready', return_value=False) as mock_wait_g2_fail, \
+             patch.object(rotator_g3, 'wait_until_ready', return_value=True):
+    
+            assert group_controller.move_group_absolute(target_degrees, wait=True, move_timeout_per_rotator=0.1) is False
+>           mock_wait_g2_fail.assert_called_once()
+
+tests/test_group_controller.py:484: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <MagicMock name='wait_until_ready' id='136293695162752'>
+
+    def assert_called_once(self):
+        """assert that the mock was called only once.
+        """
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to have been called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected 'wait_until_ready' to have been called once. Called 0 times.
+
+.pixi/envs/default/lib/python3.13/unittest/mock.py:958: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:15.316 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:15.316 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:15.316 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:15.316 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:17.622 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:17.622 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:17.622 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:17.623 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:02:17.623 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:19.929 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:19.930 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:19.930 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:02:19.930 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:19.930 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:19.930 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:19.930 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:19.930 | ERROR    | elliptec_controller.controller:move_group_absolute:862 - Cannot move group: Group not formed, master address not set, or master rotator not identified.
+_______________ test_move_group_absolute_no_initial_replies_wait _______________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b67800>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b77c50>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf55951c050>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf55951c150>
+
+    def test_move_group_absolute_no_initial_replies_wait(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test move_group_absolute with wait=True, no initial replies, but rotators eventually become ready."""
+        group_controller.form_group()
+        target_degrees = 75.0
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value={}) as mock_send_group, \
+             patch.object(rotator_g1, 'wait_until_ready', return_value=True) as mock_wait_g1, \
+             patch.object(rotator_g2, 'wait_until_ready', return_value=True) as mock_wait_g2, \
+             patch.object(rotator_g3, 'wait_until_ready', return_value=True) as mock_wait_g3:
+    
+>           assert group_controller.move_group_absolute(target_degrees, wait=True) is True
+E           assert False is True
+E            +  where False = move_group_absolute(75.0, wait=True)
+E            +    where move_group_absolute = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b67800>.move_group_absolute
+
+tests/test_group_controller.py:495: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:19.965 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:19.965 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:19.966 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:19.966 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:22.272 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:22.272 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:22.272 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:22.272 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:02:22.272 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:24.579 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:24.579 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:24.579 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:02:24.579 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:24.579 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:24.579 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:24.579 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:24.580 | ERROR    | elliptec_controller.controller:move_group_absolute:862 - Cannot move group: Group not formed, master address not set, or master rotator not identified.
+_____________ test_move_group_absolute_no_initial_replies_no_wait ______________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b67920>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b77a50>
+
+    def test_move_group_absolute_no_initial_replies_no_wait(group_controller, rotator_g1):
+        """Test move_group_absolute with wait=False and no initial replies."""
+        group_controller.form_group()
+        target_degrees = 15.0
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value={}) as mock_send_group:
+            assert group_controller.move_group_absolute(target_degrees, wait=False) is False
+>           mock_send_group.assert_called_once()
+
+tests/test_group_controller.py:507: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <MagicMock name='_send_group_command_and_collect_replies' id='136293700859760'>
+
+    def assert_called_once(self):
+        """assert that the mock was called only once.
+        """
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to have been called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected '_send_group_command_and_collect_replies' to have been called once. Called 0 times.
+
+.pixi/envs/default/lib/python3.13/unittest/mock.py:958: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:24.588 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:24.588 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:24.588 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:24.588 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:26.895 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:26.895 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:26.895 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:26.896 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:02:26.896 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:29.202 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:29.202 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:29.202 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:02:29.203 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:29.203 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:29.203 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:29.203 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:29.203 | ERROR    | elliptec_controller.controller:move_group_absolute:862 - Cannot move group: Group not formed, master address not set, or master rotator not identified.
+________________________ test_get_group_status_success _________________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b65370>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b77350>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b76950>
+rotator_g3 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b77050>
+
+    def test_get_group_status_success(group_controller, rotator_g1, rotator_g2, rotator_g3):
+        """Test get_group_status with all rotators replying successfully."""
+        group_controller.form_group()
+        mock_replies = {
+            rotator_g1.physical_address: f"{rotator_g1.physical_address}GS00",
+            rotator_g2.physical_address: f"{rotator_g2.physical_address}GS09",
+            rotator_g3.physical_address: f"{rotator_g3.physical_address}GS01"
+        }
+        expected_statuses = {
+            rotator_g1.physical_address: "00",
+            rotator_g2.physical_address: "09",
+            rotator_g3.physical_address: "01"
+        }
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value=mock_replies) as mock_send_group:
+            statuses = group_controller.get_group_status()
+>           assert statuses == expected_statuses
+E           AssertionError: assert {} == {'1': '00', '...9', '3': '01'}
+E             
+E             Right contains 3 more items:
+E             {'1': '00', '2': '09', '3': '01'}
+E             Use -v to get more diff
+
+tests/test_group_controller.py:527: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:29.238 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:29.238 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:29.238 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:29.238 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:31.545 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:31.545 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:31.545 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:31.545 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:02:31.545 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:33.852 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:33.852 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:33.852 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:02:33.852 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:33.852 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:33.852 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:33.853 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:33.853 | ERROR    | elliptec_controller.controller:get_group_status:901 - Cannot get group status: Group not formed or master address not set.
+__________________ test_get_group_status_one_malformed_reply ___________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b65130>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b76650>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b76550>
+
+    def test_get_group_status_one_malformed_reply(group_controller, rotator_g1, rotator_g2):
+        """Test get_group_status when one rotator returns a malformed reply."""
+        controller = ElliptecGroupController(rotators=[rotator_g1, rotator_g2])
+        controller.form_group()
+        mock_replies = {
+            rotator_g1.physical_address: f"{rotator_g1.physical_address}GS00",
+            rotator_g2.physical_address: f"{rotator_g2.physical_address}GSError" # Malformed
+        }
+        expected_statuses = {
+            rotator_g1.physical_address: "00",
+            rotator_g2.physical_address: "Error: BadFormat"
+        }
+        with patch.object(controller, '_send_group_command_and_collect_replies', return_value=mock_replies):
+            statuses = controller.get_group_status()
+>           assert statuses == expected_statuses
+E           AssertionError: assert {} == {'1': '00', '...r: BadFormat'}
+E             
+E             Right contains 2 more items:
+E             {'1': '00', '2': 'Error: BadFormat'}
+E             Use -v to get more diff
+
+tests/test_group_controller.py:544: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:33.861 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:33.861 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 2 rotators. Master: GroupMaster-1
+2025-05-26 15:02:33.861 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:33.861 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:33.861 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:36.167 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:36.167 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:36.167 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:36.167 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:36.167 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:36.167 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:36.167 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:36.168 | ERROR    | elliptec_controller.controller:get_group_status:901 - Cannot get group status: Group not formed or master address not set.
+___________________ test_get_group_status_one_missing_reply ____________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b67650>
+rotator_g1 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b76750>
+rotator_g2 = <elliptec_controller.controller.ElliptecRotator object at 0x7bf558b76450>
+
+    def test_get_group_status_one_missing_reply(group_controller, rotator_g1, rotator_g2):
+        """Test get_group_status when one rotator does not reply."""
+        controller = ElliptecGroupController(rotators=[rotator_g1, rotator_g2])
+        controller.form_group()
+        mock_replies = {
+            rotator_g1.physical_address: f"{rotator_g1.physical_address}GS00"
+            # rotator_g2 missing
+        }
+        expected_statuses = {
+            rotator_g1.physical_address: "00"
+        } # Only g1's status should be present
+        with patch.object(controller, '_send_group_command_and_collect_replies', return_value=mock_replies):
+            statuses = controller.get_group_status()
+>           assert statuses == expected_statuses
+E           AssertionError: assert {} == {'1': '00'}
+E             
+E             Right contains 1 more item:
+E             {'1': '00'}
+E             Use -v to get more diff
+
+tests/test_group_controller.py:559: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:36.175 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:36.176 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 2 rotators. Master: GroupMaster-1
+2025-05-26 15:02:36.176 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:36.176 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:36.176 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:38.482 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:38.482 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:38.482 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:38.482 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:38.482 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:38.482 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:38.483 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:38.483 | ERROR    | elliptec_controller.controller:get_group_status:901 - Cannot get group status: Group not formed or master address not set.
+_______________________ test_get_group_status_no_replies _______________________
+
+group_controller = <elliptec_controller.controller.ElliptecGroupController object at 0x7bf558b671d0>
+
+    def test_get_group_status_no_replies(group_controller):
+        """Test get_group_status when no rotators reply."""
+        group_controller.form_group()
+        with patch.object(group_controller, '_send_group_command_and_collect_replies', return_value={}) as mock_send_group:
+            statuses = group_controller.get_group_status()
+            assert statuses == {}
+>           mock_send_group.assert_called_once()
+
+tests/test_group_controller.py:567: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <MagicMock name='_send_group_command_and_collect_replies' id='136293700860768'>
+
+    def assert_called_once(self):
+        """assert that the mock was called only once.
+        """
+        if not self.call_count == 1:
+            msg = ("Expected '%s' to have been called once. Called %s times.%s"
+                   % (self._mock_name or 'mock',
+                      self.call_count,
+                      self._calls_repr()))
+>           raise AssertionError(msg)
+E           AssertionError: Expected '_send_group_command_and_collect_replies' to have been called once. Called 0 times.
+
+.pixi/envs/default/lib/python3.13/unittest/mock.py:958: AssertionError
+---------------------------- Captured stderr setup -----------------------------
+2025-05-26 15:02:38.491 | INFO     | elliptec_controller.controller:__init__:654 - GroupController initialized with 3 rotators. Master: GroupMaster-1
+----------------------------- Captured stderr call -----------------------------
+2025-05-26 15:02:38.491 | INFO     | elliptec_controller.controller:form_group:676 - Forming group with master GroupMaster-1 on group address '1'
+2025-05-26 15:02:38.491 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-2 (PhysAddr: 2) to listen to 1
+2025-05-26 15:02:38.491 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 2) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:40.796 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:40.797 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:40.797 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-2
+2025-05-26 15:02:40.797 | DEBUG    | elliptec_controller.controller:form_group:679 - Configuring slave GroupSlave-3 (PhysAddr: 3) to listen to 1
+2025-05-26 15:02:40.797 | INFO     | elliptec_controller.controller:configure_as_group_slave:483 - Configuring (phys_addr: 3) to listen to master_addr: 1 with offset: 0.0 deg.
+2025-05-26 15:02:43.103 | WARNING  | elliptec_controller.controller:send_command:213 - No response or timed out after 2.25s
+2025-05-26 15:02:43.104 | ERROR    | elliptec_controller.controller:configure_as_group_slave:496 - Failed to configure as slave. Response: 
+2025-05-26 15:02:43.104 | ERROR    | elliptec_controller.controller:form_group:681 - Failed to configure slave GroupSlave-3
+2025-05-26 15:02:43.104 | ERROR    | elliptec_controller.controller:form_group:690 - Failed to form group completely. Attempting to disband partial group.
+2025-05-26 15:02:43.104 | INFO     | elliptec_controller.controller:disband_group:698 - Disbanding group (Master was on: 1).
+2025-05-26 15:02:43.104 | DEBUG    | elliptec_controller.controller:disband_group:712 - Reset master GroupMaster-1 active address to physical 1
+2025-05-26 15:02:43.104 | INFO     | elliptec_controller.controller:disband_group:715 - Group successfully disbanded.
+2025-05-26 15:02:43.104 | ERROR    | elliptec_controller.controller:get_group_status:901 - Cannot get group status: Group not formed or master address not set.
+=========================== short test summary info ============================
+FAILED tests/test_group_controller.py::test_disband_group_one_slave_fails_revert
+FAILED tests/test_group_controller.py::test_home_group_success_wait - TypeErr...
+FAILED tests/test_group_controller.py::test_home_group_success_no_wait - asse...
+FAILED tests/test_group_controller.py::test_home_group_fail_one_rotator_wait
+FAILED tests/test_group_controller.py::test_home_group_no_initial_replies_wait
+FAILED tests/test_group_controller.py::test_home_group_no_initial_replies_no_wait
+FAILED tests/test_group_controller.py::test_stop_group_success - assert False...
+FAILED tests/test_group_controller.py::test_stop_group_no_replies - Assertion...
+FAILED tests/test_group_controller.py::test_move_group_absolute_success_wait
+FAILED tests/test_group_controller.py::test_move_group_absolute_success_no_wait
+FAILED tests/test_group_controller.py::test_move_group_absolute_fail_one_wait
+FAILED tests/test_group_controller.py::test_move_group_absolute_no_initial_replies_wait
+FAILED tests/test_group_controller.py::test_move_group_absolute_no_initial_replies_no_wait
+FAILED tests/test_group_controller.py::test_get_group_status_success - Assert...
+FAILED tests/test_group_controller.py::test_get_group_status_one_malformed_reply
+FAILED tests/test_group_controller.py::test_get_group_status_one_missing_reply
+FAILED tests/test_group_controller.py::test_get_group_status_no_replies - Ass...
+=================== 17 failed, 34 passed in 77.70s (0:01:17) ===================
