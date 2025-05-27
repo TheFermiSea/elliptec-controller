@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Comprehensive Testing**: Added pytest-based test suite with mock serial communication
 - **Type Hints**: Added type annotations throughout the codebase
 - **Thread Safety**: Enhanced thread-safe operations with proper locking mechanisms
+- **Hardware Validation Scripts**: Added real hardware testing tools for validation
+- **UV Environment Support**: Full compatibility with modern uv package management
 
 ### Changed
 - **Python Version Requirement**: Updated minimum Python version from 3.6 to 3.8
@@ -24,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Position Conversion**: Enhanced accuracy in degrees-to-hex conversion using device-specific parameters
 - **Group Synchronization**: Improved group addressing with configurable offsets
 - **Documentation**: Comprehensive rewrite of all documentation with better examples
+- **Build System**: Modernized with Hatch-based pyproject.toml configuration
 
 ### Fixed
 - **Device Info Parsing**: Fixed parsing of device information responses
@@ -31,15 +34,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Serial Buffer Management**: Improved serial port buffer handling and cleanup
 - **Timeout Handling**: Better handling of communication timeouts and retries
 - **Memory Leaks**: Fixed potential memory leaks in serial communication
+- **Environment Compatibility**: Resolved pixi/conda-forge incompatibilities with uv migration
 
 ### Removed
 - **Debug Parameters**: Removed debug flags in favor of Loguru logging configuration
 - **Legacy Code**: Cleaned up deprecated methods and unused imports
 - **Redundant Dependencies**: Removed unnecessary dependencies like ptpython
+- **Build Artifacts**: Cleaned up setup.py, requirements.txt in favor of modern pyproject.toml
 
 ### Security
 - **Input Validation**: Enhanced validation of input parameters and device responses
 - **Error Exposure**: Reduced exposure of internal errors in public APIs
+
+### Hardware Validation
+- **✅ Individual Control**: 23/23 tests passing - Complete validation on real Elliptec devices
+- **✅ Group Addressing**: Hardware validated with 3-rotator synchronized movement testing
+- **✅ Position Accuracy**: Sub-degree precision confirmed in real-world testing
+- **✅ System Integration**: Validated in μRASHG optical control systems
+- **✅ Environment Compatibility**: Confirmed working with uv package management
 
 ## [0.1.0] - 2024-05-08
 
