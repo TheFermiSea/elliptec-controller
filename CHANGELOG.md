@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2024-06-10
+
+### Added
+- **Asynchronous Communication**: Added non-blocking operation via threaded communication
+- **Context Manager Support**: Added `__enter__`/`__exit__` for clean resource management
+- **Per-Command Response Queues**: Implemented per-command queues for reliable async communication
+- **Thread Lifecycle Management**: Added `connect()`/`disconnect()` methods for managing async threads
+- **Mixed Operation Modes**: Support for mixing synchronous and asynchronous commands
+- **Async Examples**: Added comprehensive examples demonstrating asynchronous usage patterns
+- **Error Recovery**: Enhanced error handling for asynchronous operations
+
 ## [0.2.0] - 2024-05-27
 
 ### Added
@@ -20,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **UV Environment Support**: Full compatibility with modern uv package management
 
 ### Changed
+- **Communication Architecture**: Refactored serial communication to support both sync and async modes
+- **Command Processing**: Enhanced command processing with thread-safe queuing system
 - **Python Version Requirement**: Updated minimum Python version from 3.6 to 3.8
 - **Logging System**: Migrated from debug flags to Loguru-based logging system
 - **Configuration Management**: Improved device configuration and parameter handling
@@ -32,8 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Device Info Parsing**: Fixed parsing of device information responses
 - **Position Accuracy**: Corrected position conversion calculations for different device types
 - **Serial Buffer Management**: Improved serial port buffer handling and cleanup
-- **Timeout Handling**: Better handling of communication timeouts and retries
+- **Timeout Handling**: Better handling of communication timeouts and retries with per-command control
 - **Memory Leaks**: Fixed potential memory leaks in serial communication
+- **Command Cancellation**: Added graceful command cancellation via worker thread management
 - **Environment Compatibility**: Resolved pixi/conda-forge incompatibilities with uv migration
 
 ### Removed
@@ -50,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **✅ Individual Control**: 23/23 tests passing - Complete validation on real Elliptec devices
 - **✅ Group Addressing**: Hardware validated with 3-rotator synchronized movement testing
 - **✅ Position Accuracy**: Sub-degree precision confirmed in real-world testing
+- **✅ Asynchronous Control**: Validated non-blocking operation with multiple simultaneous devices
 - **✅ System Integration**: Validated in μRASHG optical control systems
 - **✅ Environment Compatibility**: Confirmed working with uv package management
 
@@ -80,6 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Version History Summary
 
+- **v0.3.0**: Added asynchronous operation and context manager support
 - **v0.2.0**: Major refactor with Loguru logging, enhanced features, and improved reliability
 - **v0.1.0**: Initial release with basic Elliptec rotator control functionality
 

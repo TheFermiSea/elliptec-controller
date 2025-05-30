@@ -1,6 +1,8 @@
 # API Reference
 
-✅ **HARDWARE VALIDATED** - All methods confirmed working with real Elliptec devices
+✅ **HARDWARE VALIDATED** - All methods confirmed working with real Elliptec devices  
+✅ **ASYNCHRONOUS SUPPORT** - Non-blocking operation through threading  
+✅ **CODE QUALITY** - Improved error handling and consistent formatting
 
 ## ElliptecRotator Class
 
@@ -24,6 +26,7 @@ ElliptecRotator(port, motor_address, name=None, auto_home=True)
 - `serial.SerialException`: If serial port cannot be opened
 - `ValueError`: If port type is unsupported
 - `ConnectionError`: If device communication fails
+- `ElliptecError`: If errors occur during device communication
 
 ### Core Movement Methods
 
@@ -182,15 +185,49 @@ Boolean indicating if the rotator is currently moving.
 #### `velocity`
 Current velocity setting.
 
+### Asynchronous Communication
+
+#### `connect()`
+Starts the asynchronous serial communication thread.
+
+**Returns:**
+- None
+
+**Note:**
+- This method is automatically called when using the context manager
+- Sets `_use_async` to True, making async mode the default after connecting
+
+#### `disconnect()`
+Stops the asynchronous serial communication thread.
+
+**Returns:**
+- None
+
+**Note:**
+- This method is automatically called when exiting the context manager
+
+#### `__enter__()` and `__exit__()`
+Context manager methods for automatic thread management.
+
+```python
+with ElliptecRotator("/dev/ttyUSB0", motor_address=1) as rotator:
+    # Thread automatically starts and stops
+    rotator.move_absolute(45.0)  # Uses async mode by default
+```
+
 ### Low-Level Communication
 
-#### `send_command(command, data=None, timeout=1.0)`
+#### `send_command(command, data=None, timeout=1.0, send_addr_override=None, expect_reply_from_addr=None, timeout_multiplier=1.0, use_async=None)`
 Send a raw command to the device.
 
 **Parameters:**
 - `command` (str): Two-character command code
 - `data` (str, optional): Additional data to send
 - `timeout` (float): Response timeout in seconds
+- `send_addr_override` (str, optional): Override the address used for sending
+- `expect_reply_from_addr` (str, optional): Override the address to expect in reply
+- `timeout_multiplier` (float): Multiply default timeouts by this factor
+- `use_async` (bool, optional): Whether to use asynchronous mode (if None, uses instance default)
 
 **Returns:**
 - `str`: Device response, or empty string if timeout/error
@@ -291,6 +328,20 @@ The package exports all ELLx protocol command constants:
 
 **Hardware Validated**: ✅ Error handling tested with real devices under various conditions
 
+## Implementation Details
+
+The asynchronous implementation uses a per-command queue approach for responses:
+
+- Each command gets its own `reply_future` queue
+- The worker thread puts the response into this specific queue
+- This approach avoids command/response mismatches that could occur with a shared queue
+
+This implementation offers several advantages:
+1. Better isolation between commands
+2. More robust error handling
+3. Cleaner timeout management
+4. Easier to reason about which response belongs to which command
+
 ## Logging Integration
 
 The package uses Loguru for logging. Configure logging in your application:
@@ -313,6 +364,30 @@ Log messages include:
 
 **Hardware Validated**: ✅ Logging extensively tested during real device validation
 
+## Asynchronous Usage
+
+The ElliptecRotator supports asynchronous operation through threading:
+
+```python
+# Using async mode with context manager
+with ElliptecRotator("/dev/ttyUSB0", motor_address=1) as rotator:
+    # Commands are processed asynchronously by default after connect()
+    rotator.move_absolute(45.0)  # Non-blocking operation
+
+# Manual async control
+rotator = ElliptecRotator("/dev/ttyUSB0", motor_address=1)
+rotator.connect()  # Start async thread
+rotator.move_absolute(45.0, use_async=True)  # Explicit async usage
+rotator.move_absolute(90.0, use_async=False)  # Force sync for this operation
+rotator.disconnect()  # Stop async thread
+```
+
+**Key Benefits:**
+- Non-blocking serial I/O operations
+- Reduced latency in multi-device setups
+- Improved responsiveness in GUI applications
+- Compatible with existing synchronous API
+
 ## Hardware Validation Summary
 
 **Individual Control**: ✅ 23/23 tests passing
@@ -324,6 +399,13 @@ Log messages include:
 - Group formation and synchronized movement confirmed
 - Offset application working correctly
 - Clean reversion to individual control validated
+
+**Asynchronous Mode**: ✅ Implemented and validated
+- Thread-safe command queuing with per-command response queues
+- Non-blocking I/O operations
+- Compatible with all existing functionality
+- Context manager support for clean resource management
+- Improved error handling and logging
 
 **Real-World Usage**: ✅ Deployed in μRASHG optical systems
 - 3-rotator synchronized control

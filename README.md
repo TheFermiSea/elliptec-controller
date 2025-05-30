@@ -5,6 +5,7 @@ A Python package for controlling Thorlabs Elliptec rotation stages (ELL6, ELL14,
 ✅ **HARDWARE VALIDATED** - Confirmed working with real Elliptec devices  
 ✅ **PRODUCTION READY** - 100% core functionality tested  
 ✅ **GROUP ADDRESSING VERIFIED** - Synchronized multi-rotator control working  
+✅ **ASYNCHRONOUS SUPPORT** - Non-blocking operation via threading
 
 ## Features
 
@@ -12,6 +13,7 @@ A Python package for controlling Thorlabs Elliptec rotation stages (ELL6, ELL14,
 - **Group Synchronization**: Coordinate multiple rotators with configurable offsets *(hardware validated)*
 - **Comprehensive Protocol Support**: Full implementation of the ELLx protocol manual
 - **Thread-Safe Design**: Safe for use in multi-threaded applications
+- **Asynchronous Operation**: Non-blocking commands via dedicated threading *(optimized implementation)*
 - **Advanced Logging**: Detailed logging with Loguru for debugging and monitoring
 - **Device Information**: Automatic retrieval of device specifications and capabilities
 - **Position Conversion**: Seamless conversion between degrees and device-specific pulse counts
@@ -68,6 +70,26 @@ position = rotator.update_position()       # Get current position
 print(f"Current position: {position:.2f}°")
 ```
 
+### Asynchronous Control (Non-blocking)
+
+```python
+from elliptec_controller import ElliptecRotator
+
+# Using context manager for automatic thread management
+with ElliptecRotator("/dev/ttyUSB0", motor_address=1) as rotator:
+    # Commands use async mode by default after connect()
+    rotator.home(wait=True)                    # Home the device
+    rotator.move_absolute(45.0, wait=False)    # Non-blocking move
+    # Do other work while moving...
+    rotator.wait_until_ready()                 # Wait when needed
+    
+    # Mix sync and async as needed
+    rotator.move_absolute(90.0, use_async=False)  # Force synchronous
+    rotator.move_absolute(180.0, use_async=True)  # Explicit async
+    
+    # Thread is automatically stopped when exiting context
+```
+
 ### Command Line Interface
 
 The package includes a CLI tool for quick operations:
@@ -87,6 +109,37 @@ elliptec-controller info --port /dev/ttyUSB0 --address 1
 ```
 
 ## Advanced Usage
+
+### Asynchronous Operation
+
+Control devices with non-blocking commands via dedicated threading:
+
+```python
+from elliptec_controller import ElliptecRotator
+
+# Method 1: Using context manager (recommended)
+with ElliptecRotator("/dev/ttyUSB0", motor_address=1) as rotator:
+    # Thread automatically started by context manager
+    rotator.move_absolute(45.0)  # Uses async mode by default
+    # Other code runs while device is moving
+    
+    # Wait only when needed
+    rotator.wait_until_ready()
+    print(f"Current position: {rotator.position_degrees:.2f}°")
+    # Thread automatically stopped when exiting context
+
+# Method 2: Manual thread management
+rotator = ElliptecRotator("/dev/ttyUSB0", motor_address=1)
+rotator.connect()  # Manually start the async thread
+
+# Mix synchronous and asynchronous as needed
+rotator.move_absolute(45.0, use_async=True)   # Explicit async usage
+rotator.move_absolute(90.0, use_async=False)  # Force synchronous for this call
+
+rotator.disconnect()  # Manually stop the async thread
+```
+
+The implementation uses per-command response queues for improved reliability and clearer error handling.
 
 ### Synchronized Group Movement
 
@@ -245,6 +298,11 @@ ElliptecRotator(port, motor_address, name=None, auto_home=True)
 - `set_velocity(velocity)`: Set movement velocity
 - `get_device_info()`: Retrieve device information
 
+#### Thread Management Methods
+- `connect()`: Start the async communication thread
+- `disconnect()`: Stop the async communication thread
+- `__enter__()`, `__exit__()`: Context manager support
+
 #### Group Control Methods
 - `configure_as_group_slave(master_address, offset_degrees)`: Configure for synchronized movement
 - `revert_from_group_slave()`: Return to individual control
@@ -288,6 +346,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - **Device Communication**: Hardware validated
 - **Position Accuracy**: Sub-degree precision confirmed
 - **Protocol Implementation**: Complete ELLx support
+- **Asynchronous Mode**: Non-blocking operation via threading with per-command response queues
 
 ### ✅ Group Addressing (Hardware Validated)
 - **Group Formation**: Working on real devices
