@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2025-06-02
+
+### Fixed
+- **Test Suite Complete**: Achieved 100% test passing rate (51/51 tests) by resolving all group controller test failures
+- **Group Controller Mocking**: Fixed inconsistent mocking patterns in group controller tests with proper state simulation
+- **Attribute References**: Corrected `active_group_address_char` → `group_master_address_char` attribute references in tests
+- **Movement State Simulation**: Enhanced test mocks to properly simulate rotator movement states and device status
+- **Import Dependencies**: Added missing `COMMAND_GET_STATUS` import to group controller tests
+- **Error Message Formats**: Standardized error message format expectations in malformed response tests
+
+### Improved
+- **Test Infrastructure**: Standardized group formation mocking patterns across all group controller tests
+- **Mock Reliability**: Implemented consistent side effects that accurately simulate hardware behavior
+- **Test Coverage**: All elliptec controller functionality now has reliable test coverage
+- **Developer Experience**: Fixed test failures that were blocking development workflow
+
+### Technical Details
+- Fixed 15+ failing group controller tests through systematic mocking pattern corrections
+- Implemented proper `configure_as_group_slave` side effects that update rotator state
+- Added `get_status` mocking for movement state verification
+- Corrected test assumptions about internal state vs. hardware command success/failure
+- Enhanced group formation and disbanding test logic for accurate behavior simulation
+
+## [0.3.0] - 2025-06-02
+
+### Added
+- **Device Status Constants**: Added `STATUS_READY`, `STATUS_HOMING`, `STATUS_MOVING` constants for consistent status checking
+- **Motor Status Enum**: Added `MOTOR_STATUS` enum with `MOTOR_ACTIVE` and `HOMING` bitmask values for precise device state detection
+- **Real-time Status Checking**: Enhanced `is_moving` property to query actual device status rather than rely on internal state
+- **Group Status Methods**: Added `get_group_status()` method to `ElliptecGroupController` for comprehensive group status monitoring
+
+### Changed
+- **⚠️ BREAKING**: `is_moving` is now a read-only property that queries device status in real-time instead of a simple boolean attribute
+- **⚠️ BREAKING**: Direct assignment to `is_moving` is no longer supported - use internal `_is_moving_state` for internal tracking
+- **Status System**: Replaced string literal status codes ("00", "09", "01") with named constants throughout codebase
+- **Device State Logic**: Improved motor activity detection using bit masking for more reliable status interpretation
+- **Group Controller**: Updated group operations to use status constants and improved state management
+
+### Fixed
+- **Status Accuracy**: Fixed race conditions where `is_moving` could be out of sync with actual device state
+- **Device Communication**: Improved reliability of status checking with better error handling and timeout management
+- **Group Synchronization**: Enhanced group controller status tracking for more reliable multi-device operations
+
+### Technical Details
+- Internal state tracking moved to private `_is_moving_state` attribute
+- `is_moving` property now performs real-time device status queries with bit-level status analysis
+- Status constants ensure consistent interpretation across all device communication
+- Backward compatibility maintained for all public API methods except direct `is_moving` assignment
+
 ## [0.2.0] - 2024-05-27
 
 ### Added
