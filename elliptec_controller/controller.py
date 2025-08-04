@@ -10,6 +10,7 @@ Protocol details based on the Thorlabs Elliptec documentation.
 import serial
 import time
 import threading
+import os
 from typing import Dict, List, Optional, Union, Any
 from loguru import logger
 from enum import Enum
@@ -67,6 +68,88 @@ def hex_to_degrees(hex_val: str, pulse_per_revolution: int = 262144) -> float:
     return value / pulses_per_deg
 
 
+class MockSerialForCI:
+    """
+    Simple mock serial interface for CI environments.
+    Simulates basic Elliptec responses to prevent hardware connection attempts.
+    """
+    def __init__(self, port=None, baudrate=None, bytesize=None, parity=None, stopbits=None, timeout=None):
+        self.port = port
+        self.is_open = True
+        self.timeout = timeout or 1.0
+        self._read_buffer = b""
+        self._last_command = ""
+        
+        # Mock responses for different commands
+        self._responses = {
+            "gs": "GS00",  # Status: ready
+            "in": "IN0E1140060920231701016800023000",  # Device info
+            "gp": "PO00000000",  # Position: 0 degrees
+            "gv": "GV3C",  # Velocity: 60 (hex)
+            "gj": "GJ00000500",  # Jog step: ~1 degree
+            "ho0": "GS00",  # Home complete
+            "st": "GS00",  # Stop acknowledge
+        }
+        
+    def write(self, data):
+        """Mock write that prepares response based on command."""
+        if isinstance(data, bytes):
+            command_str = data.decode('ascii', errors='ignore')
+        else:
+            command_str = str(data)
+            
+        # Remove carriage return and extract command
+        command_str = command_str.replace('\\r', '').replace('\r', '').strip()
+        
+        if len(command_str) >= 3:
+            # Extract address and command (e.g., "1gs" -> address="1", cmd="gs")
+            address = command_str[0]
+            cmd = command_str[1:]
+            
+            # Find matching response
+            response = None
+            for key, value in self._responses.items():
+                if cmd.startswith(key):
+                    response = f"{address}{value}"
+                    break
+            
+            # Default response if no match
+            if response is None:
+                response = f"{address}GS00"  # Default to status OK
+                
+            # Prepare response for reading
+            self._read_buffer = (response + "\r\n").encode('ascii')
+        
+        return len(data)
+        
+    def read(self, size=1):
+        """Mock read that returns prepared response."""
+        if self._read_buffer:
+            result = self._read_buffer[:size]
+            self._read_buffer = self._read_buffer[size:]
+            return result
+        return b""
+        
+    def flush(self):
+        pass
+        
+    def reset_input_buffer(self):
+        self._read_buffer = b""
+        
+    def reset_output_buffer(self):
+        pass
+        
+    def close(self):
+        self.is_open = False
+        
+    def open(self):
+        self.is_open = True
+        
+    @property
+    def in_waiting(self):
+        return len(self._read_buffer)
+
+
 class ElliptecRotator:
     def __init__(
         self,
@@ -94,6 +177,9 @@ class ElliptecRotator:
         self.pulses_per_deg = self.pulse_per_revolution / 360.0
         self.device_info: Dict[str, str] = {}
 
+        # Check if we're running in CI environment
+        is_ci = os.environ.get('CI', '').lower() in ('true', '1', 'yes')
+        
         if (not isinstance(port, str) and hasattr(port, "log") and hasattr(port, "write")):
             self.serial = port
             self._fixture_test = True
@@ -105,48 +191,60 @@ class ElliptecRotator:
         elif hasattr(port, 'write') and hasattr(port, 'read') and hasattr(port, 'flush'):
             self.serial = port
         elif isinstance(port, str):
-            self.serial = serial.Serial(port=port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1)
-            try:
-                self.serial.reset_input_buffer()
-                self.serial.reset_output_buffer()
-            except serial.SerialException as e:
-                self.logger.warning(f"Error resetting serial port buffers during init: {e}")
+            if is_ci:
+                # In CI environment, use mock serial instead of real hardware
+                self.logger.info(f"CI environment detected, using mock serial for port {port}")
+                self.serial = MockSerialForCI(port=port)
+                self._fixture_test = True
+                self._mock_in_test = True
+                self.position_degrees = 0.0
+                self.pulse_per_revolution = 262144
+                self.pulses_per_deg = self.pulse_per_revolution / 360.0
+                # Skip the hardware initialization steps when in CI
+                auto_home = False
+            else:
+                self.serial = serial.Serial(port=port, baudrate=9600, bytesize=8, parity="N", stopbits=1, timeout=1)
+                try:
+                    self.serial.reset_input_buffer()
+                    self.serial.reset_output_buffer()
+                except serial.SerialException as e:
+                    self.logger.warning(f"Error resetting serial port buffers during init: {e}")
 
-            try:
-                device_info_retrieved = self.get_device_info()
-                if device_info_retrieved and device_info_retrieved.get("type") not in ["Error", "Unknown"]:
-                    pulses_dec_str = device_info_retrieved.get("pulses_per_unit_decimal")
-                    if pulses_dec_str:
+                try:
+                    device_info_retrieved = self.get_device_info()
+                    if device_info_retrieved and device_info_retrieved.get("type") not in ["Error", "Unknown"]:
+                        pulses_dec_str = device_info_retrieved.get("pulses_per_unit_decimal")
+                        if pulses_dec_str:
+                            try:
+                                pulses_dec = int(pulses_dec_str)
+                                if pulses_dec > 0:
+                                    self.pulse_per_revolution = pulses_dec
+                                    self.pulses_per_deg = pulses_dec / 360.0
+                                    self.logger.debug(f"__init__ set pulse_per_revolution to {self.pulse_per_revolution} from get_device_info return.")
+                                else:
+                                    self.logger.warning(f"__init__ received invalid pulses_dec: {pulses_dec} from get_device_info. Using default: {self.pulse_per_revolution}")
+                            except ValueError:
+                                self.logger.warning(f"__init__ could not parse pulses_dec_str: '{pulses_dec_str}' from get_device_info. Using default: {self.pulse_per_revolution}")
+                    else:
+                        self.logger.warning(f"__init__ did not get valid device info to set pulse_per_revolution. Using default: {self.pulse_per_revolution}")
+
+                    if auto_home and not (hasattr(self, '_fixture_test') and self._fixture_test):
                         try:
-                            pulses_dec = int(pulses_dec_str)
-                            if pulses_dec > 0:
-                                self.pulse_per_revolution = pulses_dec
-                                self.pulses_per_deg = pulses_dec / 360.0
-                                self.logger.debug(f"__init__ set pulse_per_revolution to {self.pulse_per_revolution} from get_device_info return.")
-                            else:
-                                self.logger.warning(f"__init__ received invalid pulses_dec: {pulses_dec} from get_device_info. Using default: {self.pulse_per_revolution}")
-                        except ValueError:
-                            self.logger.warning(f"__init__ could not parse pulses_dec_str: '{pulses_dec_str}' from get_device_info. Using default: {self.pulse_per_revolution}")
-                else:
-                    self.logger.warning(f"__init__ did not get valid device info to set pulse_per_revolution. Using default: {self.pulse_per_revolution}")
-
-                if auto_home and not (hasattr(self, '_fixture_test') and self._fixture_test):
-                    try:
-                        self.logger.info("Homing...")
-                        if not self.home(wait=True): self.logger.warning("Failed to home.")
-                        self.logger.info("Getting position...")
-                        self.update_position()
-                        self.logger.info("Getting velocity...")
-                        velocity_val = self.get_velocity()
-                        if velocity_val is not None: self.velocity = velocity_val
-                        self.logger.info("Getting jog step...")
-                        jog_step = self.get_jog_step()
-                        if jog_step is not None: self._jog_step_size = jog_step
-                        self.logger.info("Initialization complete.")
-                    except Exception as init_e:
-                        self.logger.error(f"Error during attribute initialization: {init_e}", exc_info=True)
-            except Exception as e:
-                self.logger.error(f"Error retrieving device info during init: {e}", exc_info=True)
+                            self.logger.info("Homing...")
+                            if not self.home(wait=True): self.logger.warning("Failed to home.")
+                            self.logger.info("Getting position...")
+                            self.update_position()
+                            self.logger.info("Getting velocity...")
+                            velocity_val = self.get_velocity()
+                            if velocity_val is not None: self.velocity = velocity_val
+                            self.logger.info("Getting jog step...")
+                            jog_step = self.get_jog_step()
+                            if jog_step is not None: self._jog_step_size = jog_step
+                            self.logger.info("Initialization complete.")
+                        except Exception as init_e:
+                            self.logger.error(f"Error during attribute initialization: {init_e}", exc_info=True)
+                except Exception as e:
+                    self.logger.error(f"Error retrieving device info during init: {e}", exc_info=True)
         else:
             raise ValueError(f"Unsupported port type: {type(port)}. Must be str, serial.Serial, or a compatible mock.")
 
