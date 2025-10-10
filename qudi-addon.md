@@ -250,8 +250,8 @@ This add-on provides a Qudi device driver for controlling the Elliptec ELL14 rot
 
             # Send initial configuration commands after successful connection
             try:
-                self.set_units(self.units)
-                self.set_speed(self.speed)
+                self.set_units(self._units)
+                self.set_speed(self._speed)
                 self.get_status() # Get initial status
             except Exception as e:
                 logger.warning(f"Initial configuration failed after connection: {e}")
