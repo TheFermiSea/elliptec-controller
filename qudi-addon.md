@@ -44,7 +44,7 @@ This add-on provides a Qudi device driver for controlling the Elliptec ELL14 rot
     dependencies = [
         "qudi>=0.1.0", # Adjust Qudi version as needed
         # Add the elliptec-controller library as a git dependency
-        - = "git+https://github.com/TheFermiSea/elliptec-controller.git",
+        "elliptec-controller @ git+https://github.com/TheFermiSea/elliptec-controller.git",
     ]
 
     [project.entry-points]
