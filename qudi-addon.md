@@ -391,7 +391,6 @@ This add-on provides a Qudi device driver for controlling the Elliptec ELL14 rot
 
         def __exit__(self, exc_type, exc_val, exc_tb):
             self.disconnect()
-'''
 
 5. Update README.md:
 Ensure the installation instructions correctly mention the dependency on the elliptec-controller library.
