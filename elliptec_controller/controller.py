@@ -13,7 +13,17 @@ import threading
 import queue
 from typing import Dict, List, Optional, Union, Any
 from loguru import logger
+from enum import Enum
 
+# --- Device Status Code Constants ---
+STATUS_READY = "00"
+STATUS_HOMING = "09"
+STATUS_MOVING = "01"
+
+# --- Motor Status Bitmask Enum (based on device protocol) ---
+class MOTOR_STATUS(Enum):
+    MOTOR_ACTIVE = 0x01
+    HOMING = 0x02
 
 class ElliptecError(Exception):
     """Custom exception for Elliptec controller errors."""
@@ -80,7 +90,8 @@ class ElliptecRotator:
             rotator_name=self.name, physical_address=self.physical_address
         )
 
-        self.is_moving = False
+        # Internal state attribute (do not use public .is_moving for assignment)
+        self._is_moving_state = False
         self.is_slave_in_group = False
         self.group_offset_degrees = 0.0
         self.velocity = 60
@@ -288,6 +299,36 @@ class ElliptecRotator:
             f"Timeout waiting for async response after {effective_timeout:.2f}s"
         )
         return ""
+    @property
+    def is_moving(self) -> bool:
+        """Checks if the motor is currently identified as moving by status byte."""
+        status_hex = self.get_status()
+        final_is_moving_decision = False  # Default to False
+
+        if status_hex:
+            try:
+                status_val = int(status_hex, 16)
+                is_active = (status_val & MOTOR_STATUS.MOTOR_ACTIVE.value) != 0
+                is_homing = (status_val & MOTOR_STATUS.HOMING.value) != 0
+
+                final_is_moving_decision = is_active or is_homing
+
+                self.logger.debug(
+                    f"ElliptecRotator.is_moving: status_hex='{status_hex}', status_val=0x{status_val:02X}, "
+                    f"active_bit_set={is_active}, homing_bit_set={is_homing}, "
+                    f"WILL RETURN: {final_is_moving_decision}"
+                )
+            except ValueError:
+                self.logger.warning(
+                    f"ElliptecRotator.is_moving: Could not parse status_hex '{status_hex}' to int. Returning False."
+                )
+                final_is_moving_decision = False
+        else:
+            self.logger.warning("ElliptecRotator.is_moving: Could not get valid status_hex. Assuming not moving. Returning False.")
+            final_is_moving_decision = False
+
+        return final_is_moving_decision
+
 
     def send_command(
         self,
@@ -506,7 +547,7 @@ class ElliptecRotator:
                     self.serial._log.append(cmd_str.encode())
                 return True
         status = self.get_status(timeout_override=status_check_timeout)
-        return status == "00"
+        return status == STATUS_READY
 
     def wait_until_ready(self, timeout: float = 30.0) -> bool:
         if (
@@ -526,6 +567,7 @@ class ElliptecRotator:
             if self.is_ready(status_check_timeout=polling_timeout):
                 with self._command_lock:
                     self.is_moving = False
+                with self._command_lock: self._is_moving_state = False
                 return True
             time.sleep(0.1)
         self.logger.warning(
@@ -536,15 +578,15 @@ class ElliptecRotator:
     def stop(self) -> bool:
         with self._command_lock:
             response = self.send_command(COMMAND_STOP)
-            self.is_moving = False
+            self._is_moving_state = False
             return response and response.startswith(f"{self.active_address}GS")
 
     def home(self, wait: bool = True) -> bool:
         with self._command_lock:
             response = self.send_command(COMMAND_HOME, data="0")
-            self.is_moving = True
+            self._is_moving_state = True
             if response and response.startswith(f"{self.active_address}PO"):
-                self.is_moving = False
+                self._is_moving_state = False
                 self.update_position()
                 return True
             if response and response.startswith(f"{self.active_address}GS"):
@@ -570,9 +612,12 @@ class ElliptecRotator:
                 if status == "00":
                     with self._command_lock:
                         self.is_moving = False
+                with self._command_lock: status = self.get_status()
+                if status == STATUS_READY:
+                    with self._command_lock: self._is_moving_state = False
                     self.update_position()
                     return True
-                elif status == "09" or status == "01":
+                elif status == STATUS_HOMING or status == STATUS_MOVING:
                     ready_success = self.wait_until_ready()
                     if ready_success:
                         self.update_position()
@@ -584,6 +629,7 @@ class ElliptecRotator:
                     return ready_success
             with self._command_lock:
                 self.is_moving = False
+            with self._command_lock: self._is_moving_state = False
             return True
         return False
 
@@ -781,7 +827,7 @@ class ElliptecRotator:
             )
 
             response = self.send_command(COMMAND_MOVE_ABS, data=hex_pos)
-            self.is_moving = True
+            self._is_moving_state = True
 
             if response and (
                 response.startswith(f"{self.active_address}GS")
@@ -838,13 +884,15 @@ class ElliptecRotator:
                     raise ValueError("Direction must be 'fw' or 'bw'")
                 response = self.send_command(cmd_to_send)
                 if response and response.startswith(f"{self.active_address}GS"):
-                    self.is_moving = True
+                    self._is_moving_state = True
                     return True
                 elif not response:
                     self.logger.debug(
                         f"Continuous move {cmd_to_send} sent, no immediate reply. Assuming initiated."
                     )
                     self.is_moving = True
+                    self.logger.debug(f"Continuous move {cmd_to_send} sent, no immediate reply. Assuming initiated.")
+                    self._is_moving_state = True
                     return True
                 else:
                     self.logger.warning(
@@ -1203,6 +1251,77 @@ class ElliptecRotator:
                     self.logger.trace(
                         f"Worker thread received: '{response_str}' (raw: {response_bytes!r})"
                     )
+    def stop_group(self) -> bool:
+        if not self.is_grouped or not self.group_master_address_char:
+            self.logger.error("Cannot stop group: Group not formed or master address not set.")
+            return False
+        self.logger.info(f"Sending stop command to group address '{self.group_master_address_char}'...")
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_STOP, data="", expect_num_replies=len(self.rotators),
+            overall_timeout=1.0 * len(self.rotators), reply_start_timeout=0.1
+        )
+        if not replies:
+            self.logger.warning("No replies received after sending group stop command.")
+            return False
+        all_acknowledged_stop = True
+        for rotator in self.rotators:
+            reply = replies.get(rotator.physical_address)
+            if reply and reply.startswith(f"{rotator.physical_address}GS"):
+                status_code = reply[len(f"{rotator.physical_address}GS"):].strip()
+                if status_code == STATUS_READY:
+                    self.logger.debug(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) acknowledged stop with status 00 (OK).")
+                    rotator._is_moving_state = False
+                else:
+                    self.logger.warning(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) acknowledged stop, but returned unexpected status: {status_code}")
+                    all_acknowledged_stop = False
+            else:
+                self.logger.warning(f"Did not receive expected GS reply from Rotator {rotator.name} (Addr: {rotator.physical_address}) after group stop command.")
+                all_acknowledged_stop = False
+        if all_acknowledged_stop:
+            self.logger.info("Group stop command acknowledged by all rotators with status 00.")
+            return True
+        else:
+            self.logger.error("Not all rotators acknowledged the stop command successfully.")
+            return False
+
+    def move_group_absolute(self, degrees: float, wait: bool = True, move_timeout_per_rotator: float = 45.0) -> bool:
+        if not self.is_grouped or not self.group_master_address_char or not self.master_rotator:
+            self.logger.error("Cannot move group: Group not formed, master address not set, or master rotator not identified.")
+            return False
+        target_degrees_logical = degrees % 360
+        hex_pos = degrees_to_hex(target_degrees_logical, self.master_rotator.pulse_per_revolution)
+        self.logger.info(f"Sending move_absolute command to group address '{self.group_master_address_char}' for target {target_degrees_logical:.2f} deg (hex: {hex_pos}).")
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_MOVE_ABS, data=hex_pos, expect_num_replies=len(self.rotators)
+        )
+        if not replies:
+            self.logger.warning("No replies received after sending group move_absolute command.")
+            if wait: self.logger.info("Attempting to wait for group readiness despite no initial replies.")
+            else: return False 
+        for r in self.rotators: r._is_moving_state = True
+        if wait:
+            self.logger.info("Waiting for all rotators in the group to finish movement...")
+            all_ready = True
+            for rotator in self.rotators:
+                self.logger.debug(f"Waiting for {rotator.name} (Addr: {rotator.physical_address}) to be ready...")
+                if not rotator.wait_until_ready(timeout=move_timeout_per_rotator):
+                    self.logger.error(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) did not report ready status after move within timeout.")
+                    all_ready = False
+            if all_ready:
+                self.logger.info("All rotators in the group reported ready status after move.")
+                self.logger.debug("Updating positions for all rotators in the group...")
+                for rotator in self.rotators: rotator.update_position() 
+                return True
+            else:
+                self.logger.error("Not all rotators in the group became ready after move.")
+                return False
+        else:
+            if replies:
+                self.logger.info("Group move_absolute command dispatched successfully (not waiting for completion).")
+                return True
+            else:
+                self.logger.warning("Group move_absolute command sent, but no replies received (not waiting for completion).")
+                return False
 
                     # Put response on the reply queue
                     reply_future.put(response_str)
