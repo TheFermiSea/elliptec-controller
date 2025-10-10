@@ -10,6 +10,7 @@ Protocol details based on the Thorlabs Elliptec documentation.
 import serial
 import time
 import threading
+import os
 import queue
 from typing import Dict, List, Optional, Union, Any
 from loguru import logger
@@ -75,6 +76,88 @@ def hex_to_degrees(hex_val: str, pulse_per_revolution: int = 262144) -> float:
     return value / pulses_per_deg
 
 
+class MockSerialForCI:
+    """
+    Simple mock serial interface for CI environments.
+    Simulates basic Elliptec responses to prevent hardware connection attempts.
+    """
+    def __init__(self, port=None, baudrate=None, bytesize=None, parity=None, stopbits=None, timeout=None):
+        self.port = port
+        self.is_open = True
+        self.timeout = timeout or 1.0
+        self._read_buffer = b""
+        self._last_command = ""
+        
+        # Mock responses for different commands
+        self._responses = {
+            "gs": "GS00",  # Status: ready
+            "in": "IN0E1140060920231701016800023000",  # Device info
+            "gp": "PO00000000",  # Position: 0 degrees
+            "gv": "GV3C",  # Velocity: 60 (hex)
+            "gj": "GJ00000500",  # Jog step: ~1 degree
+            "ho0": "GS00",  # Home complete
+            "st": "GS00",  # Stop acknowledge
+        }
+        
+    def write(self, data):
+        """Mock write that prepares response based on command."""
+        if isinstance(data, bytes):
+            command_str = data.decode('ascii', errors='ignore')
+        else:
+            command_str = str(data)
+            
+        # Remove carriage return and extract command
+        command_str = command_str.replace('\\r', '').replace('\r', '').strip()
+        
+        if len(command_str) >= 3:
+            # Extract address and command (e.g., "1gs" -> address="1", cmd="gs")
+            address = command_str[0]
+            cmd = command_str[1:]
+            
+            # Find matching response
+            response = None
+            for key, value in self._responses.items():
+                if cmd.startswith(key):
+                    response = f"{address}{value}"
+                    break
+            
+            # Default response if no match
+            if response is None:
+                response = f"{address}GS00"  # Default to status OK
+                
+            # Prepare response for reading
+            self._read_buffer = (response + "\r\n").encode('ascii')
+        
+        return len(data)
+        
+    def read(self, size=1):
+        """Mock read that returns prepared response."""
+        if self._read_buffer:
+            result = self._read_buffer[:size]
+            self._read_buffer = self._read_buffer[size:]
+            return result
+        return b""
+        
+    def flush(self):
+        pass
+        
+    def reset_input_buffer(self):
+        self._read_buffer = b""
+        
+    def reset_output_buffer(self):
+        pass
+        
+    def close(self):
+        self.is_open = False
+        
+    def open(self):
+        self.is_open = True
+        
+    @property
+    def in_waiting(self):
+        return len(self._read_buffer)
+
+
 class ElliptecRotator:
     def __init__(
         self,
@@ -112,11 +195,10 @@ class ElliptecRotator:
         self.pulses_per_deg = self.pulse_per_revolution / 360.0
         self.device_info: Dict[str, str] = {}
 
-        if (
-            not isinstance(port, str)
-            and hasattr(port, "log")
-            and hasattr(port, "write")
-        ):
+        # Check if we're running in CI environment
+        is_ci = os.environ.get('CI', '').lower() in ('true', '1', 'yes')
+        
+        if (not isinstance(port, str) and hasattr(port, "log") and hasattr(port, "write")):
             self.serial = port
             self._fixture_test = True
             self._mock_in_test = True
