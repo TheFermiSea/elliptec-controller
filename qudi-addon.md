@@ -411,7 +411,6 @@ devices:
     # Optional: Override defaults
     units: DEG          # Or RAD
     speed: 50           # 1-100
-'''
 
 8. Test:
 Run a Qudi script similar to the example provided in the README.md to test the connection and functionality.
