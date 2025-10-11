@@ -346,41 +346,38 @@ class ElliptecRotator:
             effective_timeout = 1.0 * timeout_multiplier
 
         # Wait for response from worker thread
-        start_time = time.time()
-        while (time.time() - start_time) < effective_timeout:
-            try:
-                response = reply_future.get(timeout=0.1)
+        try:
+            response = reply_future.get(timeout=effective_timeout)
 
-                self.logger.trace(
-                    f"Async response (expecting from addr: {address_to_expect_reply_from}): '{response}'"
+            self.logger.trace(
+                f"Async response (expecting from addr: {address_to_expect_reply_from}): '{response}'"
+            )
+
+            if response.startswith(address_to_expect_reply_from):
+                return response
+            elif (
+                len(address_to_expect_reply_from) == 1
+                and address_to_expect_reply_from.isalpha()
+                and response.lower().startswith(
+                    address_to_expect_reply_from.lower()
                 )
-
-                if response.startswith(address_to_expect_reply_from):
-                    return response
-                elif (
-                    len(address_to_expect_reply_from) == 1
-                    and address_to_expect_reply_from.isalpha()
-                    and response.lower().startswith(
-                        address_to_expect_reply_from.lower()
+            ):
+                self.logger.trace(
+                    f"Matched async response with case-insensitive address: '{response}'"
+                )
+                return response
+            else:
+                if response:
+                    self.logger.warning(
+                        f"Async response ('{response}') did not match expected address prefix '{address_to_expect_reply_from}'. Discarding."
                     )
-                ):
-                    self.logger.trace(
-                        f"Matched async response with case-insensitive address: '{response}'"
-                    )
-                    return response
-                else:
-                    if response:
-                        self.logger.warning(
-                            f"Async response ('{response}') did not match expected address prefix '{address_to_expect_reply_from}'. Discarding."
-                        )
+                return ""
 
-            except queue.Empty:
-                continue
-
-        self.logger.warning(
-            f"Timeout waiting for async response after {effective_timeout:.2f}s"
-        )
-        return ""
+        except queue.Empty:
+            self.logger.warning(
+                f"Timeout waiting for async response after {effective_timeout:.2f}s"
+            )
+            return ""
     @property
     def is_moving(self) -> bool:
         """Checks if the motor is currently identified as moving by status byte."""
@@ -648,8 +645,7 @@ class ElliptecRotator:
         while (time.time() - start_time) < timeout:
             if self.is_ready(status_check_timeout=polling_timeout):
                 with self._command_lock:
-                    self.is_moving = False
-                with self._command_lock: self._is_moving_state = False
+                    self._is_moving_state = False
                 return True
             time.sleep(0.1)
         self.logger.warning(
@@ -688,15 +684,14 @@ class ElliptecRotator:
         if not response:
             if wait:
                 time.sleep(0.5)
-                status = ""
-                with self._command_lock:
-                    status = self.get_status()
+                status = self.get_status()
                 if status == "00":
                     with self._command_lock:
-                        self.is_moving = False
-                with self._command_lock: status = self.get_status()
+                        self._is_moving_state = False
+
                 if status == STATUS_READY:
-                    with self._command_lock: self._is_moving_state = False
+                    with self._command_lock:
+                        self._is_moving_state = False
                     self.update_position()
                     return True
                 elif status == STATUS_HOMING or status == STATUS_MOVING:
@@ -710,8 +705,7 @@ class ElliptecRotator:
                         self.update_position()
                     return ready_success
             with self._command_lock:
-                self.is_moving = False
-            with self._command_lock: self._is_moving_state = False
+                self._is_moving_state = False
             return True
         return False
 
@@ -972,8 +966,6 @@ class ElliptecRotator:
                     self.logger.debug(
                         f"Continuous move {cmd_to_send} sent, no immediate reply. Assuming initiated."
                     )
-                    self.is_moving = True
-                    self.logger.debug(f"Continuous move {cmd_to_send} sent, no immediate reply. Assuming initiated.")
                     self._is_moving_state = True
                     return True
                 else:
@@ -1333,6 +1325,19 @@ class ElliptecRotator:
                     self.logger.trace(
                         f"Worker thread received: '{response_str}' (raw: {response_bytes!r})"
                     )
+
+                    # Put response on the reply queue
+                    reply_future.put(response_str)
+                    self._command_queue.task_done()
+
+                except queue.Empty:
+                    # No commands in the queue, just continue
+                    pass
+
+        finally:
+            self._is_connected = False
+            self.logger.info("Async serial worker thread stopped.")
+
     def stop_group(self) -> bool:
         if not self.is_grouped or not self.group_master_address_char:
             self.logger.error("Cannot stop group: Group not formed or master address not set.")
@@ -1404,34 +1409,6 @@ class ElliptecRotator:
             else:
                 self.logger.warning("Group move_absolute command sent, but no replies received (not waiting for completion).")
                 return False
-
-                    # Put response on the reply queue
-                    reply_future.put(response_str)
-                    self._command_queue.task_done()
-
-                except queue.Empty:
-                    # No commands in the queue, just continue
-                    continue
-                except Exception as e:
-                    self.logger.error(
-                        f"Unexpected error in worker thread: {e}", exc_info=True
-                    )
-                    time.sleep(0.1)  # Avoid tight loop on error
-
-        except Exception as e:
-            self.logger.error(
-                f"Fatal error in worker thread: {e}", exc_info=True
-            )
-        finally:
-            self._is_connected = False
-            if hasattr(self.serial, "is_open") and self.serial.is_open:
-                try:
-                    self.serial.close()
-                except Exception as e:
-                    self.logger.error(
-                        f"Error closing serial port in worker thread: {e}"
-                    )
-            self.logger.info("Async serial worker thread stopped.")
 
     def connect(self):
         """Starts the asynchronous serial communication thread."""

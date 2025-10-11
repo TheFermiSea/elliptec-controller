@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2025-10-10
+
+### Fixed
+- **CRITICAL: Syntax Error**: Fixed incomplete `_serial_thread_worker()` method that prevented package import. Added missing response handling code (`reply_future.put()`, `task_done()`) and exception/finally blocks.
+- **CRITICAL: Property Assignment Bug**: Fixed `is_moving` property being shadowed by direct instance attribute assignments in 4 locations (lines 651, 696, 713, 975). Changed all `self.is_moving = ...` to `self._is_moving_state = ...` to prevent property shadowing and ensure correct motor status reporting.
+- **Performance: Async Busy-Wait**: Replaced inefficient polling loop in `_send_command_async()` with single blocking `queue.get(timeout=...)` call, reducing CPU usage and improving response time.
+- **Code Quality: Redundant Lock Acquisitions**: Cleaned up redundant lock acquisitions and duplicate `get_status()` calls in `home()` method error handling path.
+
+### Technical Details
+- Property shadowing prevented by using internal `_is_moving_state` attribute consistently
+- Async command handling now uses blocking queue operations instead of 100ms polling
+- Simplified lock management in recovery code paths
+- All fixes identified and validated using Zen MCP Server code review with Gemini 2.5 Pro
+
 ## [0.3.1] - 2025-06-02
 
 ### Fixed
