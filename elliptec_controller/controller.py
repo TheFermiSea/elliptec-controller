@@ -1338,78 +1338,6 @@ class ElliptecRotator:
             self._is_connected = False
             self.logger.info("Async serial worker thread stopped.")
 
-    def stop_group(self) -> bool:
-        if not self.is_grouped or not self.group_master_address_char:
-            self.logger.error("Cannot stop group: Group not formed or master address not set.")
-            return False
-        self.logger.info(f"Sending stop command to group address '{self.group_master_address_char}'...")
-        replies = self._send_group_command_and_collect_replies(
-            command=COMMAND_STOP, data="", expect_num_replies=len(self.rotators),
-            overall_timeout=1.0 * len(self.rotators), reply_start_timeout=0.1
-        )
-        if not replies:
-            self.logger.warning("No replies received after sending group stop command.")
-            return False
-        all_acknowledged_stop = True
-        for rotator in self.rotators:
-            reply = replies.get(rotator.physical_address)
-            if reply and reply.startswith(f"{rotator.physical_address}GS"):
-                status_code = reply[len(f"{rotator.physical_address}GS"):].strip()
-                if status_code == STATUS_READY:
-                    self.logger.debug(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) acknowledged stop with status 00 (OK).")
-                    rotator._is_moving_state = False
-                else:
-                    self.logger.warning(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) acknowledged stop, but returned unexpected status: {status_code}")
-                    all_acknowledged_stop = False
-            else:
-                self.logger.warning(f"Did not receive expected GS reply from Rotator {rotator.name} (Addr: {rotator.physical_address}) after group stop command.")
-                all_acknowledged_stop = False
-        if all_acknowledged_stop:
-            self.logger.info("Group stop command acknowledged by all rotators with status 00.")
-            return True
-        else:
-            self.logger.error("Not all rotators acknowledged the stop command successfully.")
-            return False
-
-    def move_group_absolute(self, degrees: float, wait: bool = True, move_timeout_per_rotator: float = 45.0) -> bool:
-        if not self.is_grouped or not self.group_master_address_char or not self.master_rotator:
-            self.logger.error("Cannot move group: Group not formed, master address not set, or master rotator not identified.")
-            return False
-        target_degrees_logical = degrees % 360
-        hex_pos = degrees_to_hex(target_degrees_logical, self.master_rotator.pulse_per_revolution)
-        self.logger.info(f"Sending move_absolute command to group address '{self.group_master_address_char}' for target {target_degrees_logical:.2f} deg (hex: {hex_pos}).")
-        replies = self._send_group_command_and_collect_replies(
-            command=COMMAND_MOVE_ABS, data=hex_pos, expect_num_replies=len(self.rotators)
-        )
-        if not replies:
-            self.logger.warning("No replies received after sending group move_absolute command.")
-            if wait: self.logger.info("Attempting to wait for group readiness despite no initial replies.")
-            else: return False 
-        for r in self.rotators: r._is_moving_state = True
-        if wait:
-            self.logger.info("Waiting for all rotators in the group to finish movement...")
-            all_ready = True
-            for rotator in self.rotators:
-                self.logger.debug(f"Waiting for {rotator.name} (Addr: {rotator.physical_address}) to be ready...")
-                if not rotator.wait_until_ready(timeout=move_timeout_per_rotator):
-                    self.logger.error(f"Rotator {rotator.name} (Addr: {rotator.physical_address}) did not report ready status after move within timeout.")
-                    all_ready = False
-            if all_ready:
-                self.logger.info("All rotators in the group reported ready status after move.")
-                self.logger.debug("Updating positions for all rotators in the group...")
-                for rotator in self.rotators: rotator.update_position() 
-                return True
-            else:
-                self.logger.error("Not all rotators in the group became ready after move.")
-                return False
-        else:
-            if replies:
-                self.logger.info("Group move_absolute command dispatched successfully (not waiting for completion).")
-                return True
-            else:
-                self.logger.warning("Group move_absolute command sent, but no replies received (not waiting for completion).")
-                return False
-
     def connect(self):
         """Starts the asynchronous serial communication thread."""
         if self._serial_thread and self._serial_thread.is_alive():
@@ -1460,3 +1388,701 @@ class ElliptecRotator:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
         self.disconnect()
+
+
+class ElliptecGroupController:
+    """
+    Controller for managing a group of ElliptecRotator instances.
+
+    This class allows multiple rotators sharing the same serial port to be
+    controlled as a synchronized group. One rotator acts as the master, and
+    the others are configured as slaves that listen to a common group address.
+
+    Key features:
+    - Form and disband groups dynamically
+    - Send commands to all rotators simultaneously
+    - Support for slave position offsets
+    - Comprehensive status monitoring for all group members
+
+    Args:
+        rotators: List of ElliptecRotator instances to include in the group.
+                 All rotators must share the same serial port.
+        master_rotator_physical_address: Physical address of the master rotator.
+                                        If None, the first rotator in the list
+                                        is designated as master.
+
+    Example:
+        >>> rotator1 = ElliptecRotator(serial_port, motor_address=0)
+        >>> rotator2 = ElliptecRotator(serial_port, motor_address=1)
+        >>> rotator3 = ElliptecRotator(serial_port, motor_address=2)
+        >>>
+        >>> group = ElliptecGroupController(
+        ...     rotators=[rotator1, rotator2, rotator3],
+        ...     master_rotator_physical_address='0'
+        ... )
+        >>>
+        >>> # Form the group with default group address (master's address)
+        >>> group.form_group()
+        >>>
+        >>> # Move all rotators together
+        >>> group.move_group_absolute(45.0, wait=True)
+        >>>
+        >>> # Get status of all rotators
+        >>> statuses = group.get_group_status()
+        >>>
+        >>> # Disband when done
+        >>> group.disband_group()
+    """
+
+    def __init__(
+        self,
+        rotators: List[ElliptecRotator],
+        master_rotator_physical_address: Optional[str] = None,
+    ):
+        """
+        Initialize the group controller.
+
+        Args:
+            rotators: List of ElliptecRotator instances. Cannot be empty.
+            master_rotator_physical_address: Physical address ('0'-'F') of the
+                                            master rotator. If None, first rotator
+                                            in the list becomes master.
+
+        Raises:
+            ValueError: If rotators list is empty, master address not found,
+                       or rotators don't share the same serial port.
+        """
+        if not rotators:
+            raise ValueError("Rotators list cannot be empty.")
+
+        self.rotators = rotators
+        self.is_grouped = False
+        self.group_master_address_char: Optional[str] = None
+
+        # Verify all rotators share the same serial port instance
+        first_serial = self.rotators[0].serial
+        for rot in self.rotators[1:]:
+            if rot.serial is not first_serial:
+                raise ValueError(
+                    "All rotators in a group must share the same serial port instance."
+                )
+
+        # Identify and set the master rotator
+        if master_rotator_physical_address is None:
+            self.master_rotator = self.rotators[0]
+        else:
+            master_found = False
+            for rot in self.rotators:
+                if rot.physical_address == master_rotator_physical_address:
+                    self.master_rotator = rot
+                    master_found = True
+                    break
+            if not master_found:
+                raise ValueError(
+                    f"Master rotator with physical address '{master_rotator_physical_address}' "
+                    f"not found in the provided rotators list."
+                )
+
+        # Setup logger
+        self.logger = logger.bind(
+            controller_type="GroupController",
+            num_rotators=len(self.rotators),
+            master_address=self.master_rotator.physical_address,
+        )
+        self.logger.info(
+            f"Initialized ElliptecGroupController with {len(self.rotators)} rotators. "
+            f"Master: {self.master_rotator.name} (Address: {self.master_rotator.physical_address})"
+        )
+
+    def form_group(
+        self,
+        group_address_char: Optional[str] = None,
+        slave_offsets: Optional[Dict[str, float]] = None,
+    ) -> bool:
+        """
+        Form a group by configuring slave rotators to listen to a common address.
+
+        Args:
+            group_address_char: The group address ('0'-'F') that all rotators will
+                              listen to. If None, uses the master's physical address.
+            slave_offsets: Optional dictionary mapping rotator physical addresses
+                          to offset angles in degrees. Allows slaves to maintain
+                          a fixed angular offset from the master.
+
+        Returns:
+            True if group formation succeeded, False otherwise.
+
+        Example:
+            >>> # Form group using master's address with no offsets
+            >>> group.form_group()
+            >>>
+            >>> # Form group with custom address and slave offsets
+            >>> group.form_group(
+            ...     group_address_char='A',
+            ...     slave_offsets={'1': 10.0, '2': -15.0}
+            ... )
+        """
+        if slave_offsets is None:
+            slave_offsets = {}
+
+        # Determine the group address
+        if group_address_char is None:
+            group_address_char = self.master_rotator.physical_address
+
+        self.logger.info(
+            f"Forming group with group address '{group_address_char}'. "
+            f"Master: {self.master_rotator.name}"
+        )
+
+        # Configure each slave rotator
+        slaves = [r for r in self.rotators if r is not self.master_rotator]
+        all_slaves_configured = True
+
+        for slave in slaves:
+            offset = slave_offsets.get(slave.physical_address, 0.0)
+            self.logger.debug(
+                f"Configuring slave {slave.name} (Addr: {slave.physical_address}) "
+                f"with offset {offset:.2f} deg"
+            )
+
+            success = slave.configure_as_group_slave(group_address_char, slave_offset=offset)
+
+            if not success:
+                self.logger.error(
+                    f"Failed to configure slave {slave.name} "
+                    f"(Addr: {slave.physical_address})"
+                )
+                all_slaves_configured = False
+                break
+
+        # If any slave failed, attempt to disband the group
+        if not all_slaves_configured:
+            self.logger.warning(
+                "Group formation failed. Attempting to revert configured slaves."
+            )
+            self.disband_group()
+            return False
+
+        # Update master's active address if using a different group address
+        if group_address_char != self.master_rotator.physical_address:
+            self.master_rotator.active_address = group_address_char
+
+        # Mark group as formed
+        self.is_grouped = True
+        self.group_master_address_char = group_address_char
+
+        self.logger.info(
+            f"Successfully formed group. Group address: '{self.group_master_address_char}'. "
+            f"{len(slaves)} slave(s) configured."
+        )
+        return True
+
+    def disband_group(self) -> bool:
+        """
+        Disband the group by reverting all slave rotators to their physical addresses.
+
+        Returns:
+            True if all rotators successfully reverted, False if any failed.
+            Note that is_grouped is set to False regardless of individual failures.
+
+        Example:
+            >>> group.disband_group()
+        """
+        if not self.is_grouped:
+            self.logger.info("Group is not currently formed. Nothing to disband.")
+            return True
+
+        self.logger.info("Disbanding group...")
+
+        # Revert all slave rotators
+        slaves = [r for r in self.rotators if r is not self.master_rotator]
+        all_reverted_successfully = True
+
+        for slave in slaves:
+            self.logger.debug(
+                f"Reverting slave {slave.name} (Addr: {slave.physical_address})"
+            )
+            success = slave.revert_from_group_slave()
+            if not success:
+                self.logger.error(
+                    f"Failed to revert slave {slave.name} "
+                    f"(Addr: {slave.physical_address}). "
+                    f"Internal state reset but hardware may not have acknowledged."
+                )
+                all_reverted_successfully = False
+
+        # Revert master's active address to its physical address
+        self.master_rotator.active_address = self.master_rotator.physical_address
+
+        # Reset group state
+        self.is_grouped = False
+        self.group_master_address_char = None
+
+        if all_reverted_successfully:
+            self.logger.info("Successfully disbanded group. All rotators reverted.")
+            return True
+        else:
+            self.logger.warning(
+                "Group disbanded but some rotators failed to revert properly."
+            )
+            return False
+
+    def _send_group_command_and_collect_replies(
+        self,
+        command: str,
+        data: str = "",
+        expect_num_replies: int = 0,
+        overall_timeout: float = 3.0,
+        reply_start_timeout: float = 0.5,
+    ) -> Dict[str, str]:
+        """
+        Send a command to the group address and collect replies from all rotators.
+
+        This helper method sends a single command to the group address and waits
+        to collect individual replies from each rotator in the group. Since all
+        rotators receive the group command simultaneously, they each respond with
+        their individual physical address.
+
+        Args:
+            command: Two-character command code (e.g., 'gs', 'ho', 'ma')
+            data: Command data/parameters (e.g., hex position for 'ma')
+            expect_num_replies: Number of replies to wait for (typically len(self.rotators))
+            overall_timeout: Maximum time to wait for all replies
+            reply_start_timeout: Time to wait for first reply to start arriving
+
+        Returns:
+            Dictionary mapping physical addresses to response strings.
+            May be empty if no rotators replied.
+
+        Example:
+            >>> # Send status query to group
+            >>> replies = controller._send_group_command_and_collect_replies(
+            ...     command='gs',
+            ...     expect_num_replies=3,
+            ... )
+            >>> # replies = {'0': '0GS00', '1': '1GS00', '2': '2GS09'}
+        """
+        if not self.is_grouped or not self.group_master_address_char:
+            self.logger.error(
+                "Cannot send group command: Group not formed or address not set."
+            )
+            return {}
+
+        # Build the command string
+        cmd_str = f"{self.group_master_address_char}{command}{data}"
+        self.logger.debug(
+            f"Sending group command: '{cmd_str}' (expecting {expect_num_replies} replies)"
+        )
+
+        # Use the master rotator's serial connection to send the command
+        try:
+            self.master_rotator.serial.write(cmd_str.encode("ascii"))
+            self.master_rotator.serial.flush()
+        except Exception as e:
+            self.logger.error(f"Failed to write group command to serial: {e}")
+            return {}
+
+        # Collect replies from multiple rotators
+        replies: Dict[str, str] = {}
+        start_time = time.time()
+        first_reply_received = False
+
+        while len(replies) < expect_num_replies:
+            # Check overall timeout
+            if time.time() - start_time > overall_timeout:
+                self.logger.warning(
+                    f"Overall timeout ({overall_timeout}s) reached. "
+                    f"Received {len(replies)}/{expect_num_replies} replies."
+                )
+                break
+
+            # Check if we're still waiting for first reply
+            if not first_reply_received:
+                if time.time() - start_time > reply_start_timeout:
+                    self.logger.warning(
+                        f"No replies received within start timeout ({reply_start_timeout}s)"
+                    )
+                    break
+
+            # Read from serial if data available
+            try:
+                if self.master_rotator.serial.in_waiting > 0:
+                    # Read one response
+                    response_bytes = b""
+                    read_start = time.time()
+                    while time.time() - read_start < 0.5:  # 500ms timeout per response
+                        if self.master_rotator.serial.in_waiting > 0:
+                            chunk = self.master_rotator.serial.read(
+                                self.master_rotator.serial.in_waiting
+                            )
+                            response_bytes += chunk
+
+                            # Check for end of response
+                            if response_bytes.endswith(b"\r\n") or response_bytes.endswith(b"\n") or response_bytes.endswith(b"\r"):
+                                break
+                        time.sleep(0.01)
+
+                    if response_bytes:
+                        response_str = response_bytes.decode("ascii", errors="replace").strip()
+                        self.logger.trace(f"Received group reply: '{response_str}'")
+
+                        # Extract the physical address from the response
+                        # Response format is typically: <addr><CMD><data>
+                        # e.g., "0GS00", "1PO00000000"
+                        if len(response_str) >= 1:
+                            phys_addr = response_str[0]
+                            replies[phys_addr] = response_str
+                            first_reply_received = True
+                        else:
+                            self.logger.warning(
+                                f"Received malformed reply (too short): '{response_str}'"
+                            )
+                else:
+                    # No data available, short sleep
+                    time.sleep(0.01)
+
+            except Exception as e:
+                self.logger.error(f"Error reading group replies from serial: {e}")
+                break
+
+        self.logger.debug(
+            f"Collected {len(replies)}/{expect_num_replies} replies: "
+            f"{list(replies.keys())}"
+        )
+        return replies
+
+    def home_group(
+        self,
+        wait: bool = True,
+        home_timeout_per_rotator: float = 2.0,
+    ) -> bool:
+        """
+        Send home command to all rotators in the group simultaneously.
+
+        Args:
+            wait: If True, block until all rotators complete homing.
+                 If False, dispatch command and return immediately.
+            home_timeout_per_rotator: Timeout in seconds to wait for each
+                                     rotator to complete homing (only used if wait=True).
+
+        Returns:
+            True if command succeeded and (if wait=True) all rotators became ready.
+            False otherwise.
+
+        Example:
+            >>> # Home and wait for completion
+            >>> group.home_group(wait=True)
+            >>>
+            >>> # Home without waiting
+            >>> group.home_group(wait=False)
+        """
+        if not self.is_grouped:
+            self.logger.error("Cannot home group: Group not formed.")
+            return False
+
+        self.logger.info(
+            f"Sending home command to group address '{self.group_master_address_char}'"
+        )
+
+        # Send home command and collect initial replies
+        overall_timeout = home_timeout_per_rotator * len(self.rotators)
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_HOME,
+            data="0",  # Home direction (0 = default)
+            expect_num_replies=len(self.rotators),
+            overall_timeout=overall_timeout,
+            reply_start_timeout=0.5,
+        )
+
+        if not replies and not wait:
+            self.logger.warning(
+                "No replies received after sending group home command."
+            )
+            return False
+
+        if wait:
+            # Wait for all rotators to become ready
+            self.logger.info("Waiting for all rotators to complete homing...")
+            all_ready = True
+
+            for rotator in self.rotators:
+                self.logger.debug(
+                    f"Waiting for {rotator.name} (Addr: {rotator.physical_address}) "
+                    f"to complete homing..."
+                )
+                if not rotator.wait_until_ready(timeout=home_timeout_per_rotator):
+                    self.logger.error(
+                        f"Rotator {rotator.name} (Addr: {rotator.physical_address}) "
+                        f"did not complete homing within timeout."
+                    )
+                    all_ready = False
+
+            # Update positions after homing
+            if all_ready:
+                self.logger.debug("Updating positions for all rotators...")
+                for rotator in self.rotators:
+                    rotator.update_position()
+                self.logger.info(
+                    "All rotators completed homing successfully."
+                )
+                return True
+            else:
+                self.logger.error(
+                    "Not all rotators completed homing successfully."
+                )
+                return False
+        else:
+            # Not waiting, just return based on initial replies
+            if replies:
+                self.logger.info(
+                    "Group home command dispatched successfully "
+                    "(not waiting for completion)."
+                )
+                return True
+            else:
+                return False
+
+    def stop_group(self) -> bool:
+        """
+        Send stop command to all rotators in the group.
+
+        Returns:
+            True if all rotators acknowledged the stop command with status 00,
+            False otherwise.
+
+        Example:
+            >>> group.stop_group()
+        """
+        if not self.is_grouped or not self.group_master_address_char:
+            self.logger.error(
+                "Cannot stop group: Group not formed or master address not set."
+            )
+            return False
+
+        self.logger.info(
+            f"Sending stop command to group address '{self.group_master_address_char}'..."
+        )
+
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_STOP,
+            data="",
+            expect_num_replies=len(self.rotators),
+            overall_timeout=1.0 * len(self.rotators),
+            reply_start_timeout=0.1,
+        )
+
+        if not replies:
+            self.logger.warning(
+                "No replies received after sending group stop command."
+            )
+            return False
+
+        # Check that all rotators acknowledged stop with status 00
+        all_acknowledged_stop = True
+        for rotator in self.rotators:
+            reply = replies.get(rotator.physical_address)
+            if reply and reply.startswith(f"{rotator.physical_address}GS"):
+                status_code = reply[len(f"{rotator.physical_address}GS") :].strip()
+                if status_code == STATUS_READY:
+                    self.logger.debug(
+                        f"Rotator {rotator.name} (Addr: {rotator.physical_address}) "
+                        f"acknowledged stop with status 00 (OK)."
+                    )
+                    rotator._is_moving_state = False
+                else:
+                    self.logger.warning(
+                        f"Rotator {rotator.name} (Addr: {rotator.physical_address}) "
+                        f"acknowledged stop, but returned unexpected status: {status_code}"
+                    )
+                    all_acknowledged_stop = False
+            else:
+                self.logger.warning(
+                    f"Did not receive expected GS reply from Rotator {rotator.name} "
+                    f"(Addr: {rotator.physical_address}) after group stop command."
+                )
+                all_acknowledged_stop = False
+
+        if all_acknowledged_stop:
+            self.logger.info(
+                "Group stop command acknowledged by all rotators with status 00."
+            )
+            return True
+        else:
+            self.logger.error(
+                "Not all rotators acknowledged the stop command successfully."
+            )
+            return False
+
+    def move_group_absolute(
+        self,
+        degrees: float,
+        wait: bool = True,
+        move_timeout_per_rotator: float = 45.0,
+    ) -> bool:
+        """
+        Move all rotators in the group to an absolute position simultaneously.
+
+        The target position is sent to the group address, and all rotators move
+        together. Slave offsets (if configured during form_group) are automatically
+        applied by the hardware.
+
+        Args:
+            degrees: Target absolute position in degrees (0-360).
+            wait: If True, block until all rotators complete the move.
+                 If False, dispatch command and return immediately.
+            move_timeout_per_rotator: Timeout in seconds to wait for each rotator
+                                     (only used if wait=True).
+
+        Returns:
+            True if command succeeded and (if wait=True) all rotators reached target.
+            False otherwise.
+
+        Example:
+            >>> # Move to 45 degrees and wait
+            >>> group.move_group_absolute(45.0, wait=True)
+            >>>
+            >>> # Start move without waiting
+            >>> group.move_group_absolute(90.0, wait=False)
+        """
+        if not self.is_grouped or not self.group_master_address_char or not self.master_rotator:
+            self.logger.error(
+                "Cannot move group: Group not formed, master address not set, "
+                "or master rotator not identified."
+            )
+            return False
+
+        # Normalize to 0-360 range
+        target_degrees_logical = degrees % 360
+        hex_pos = degrees_to_hex(
+            target_degrees_logical, self.master_rotator.pulse_per_revolution
+        )
+
+        self.logger.info(
+            f"Sending move_absolute command to group address "
+            f"'{self.group_master_address_char}' for target "
+            f"{target_degrees_logical:.2f} deg (hex: {hex_pos})."
+        )
+
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_MOVE_ABS,
+            data=hex_pos,
+            expect_num_replies=len(self.rotators),
+        )
+
+        if not replies:
+            self.logger.warning(
+                "No replies received after sending group move_absolute command."
+            )
+            if wait:
+                self.logger.info(
+                    "Attempting to wait for group readiness despite no initial replies."
+                )
+            else:
+                return False
+
+        # Mark all rotators as moving
+        for r in self.rotators:
+            r._is_moving_state = True
+
+        if wait:
+            # Wait for all rotators to complete movement
+            self.logger.info(
+                "Waiting for all rotators in the group to finish movement..."
+            )
+            all_ready = True
+
+            for rotator in self.rotators:
+                self.logger.debug(
+                    f"Waiting for {rotator.name} (Addr: {rotator.physical_address}) "
+                    f"to be ready..."
+                )
+                if not rotator.wait_until_ready(timeout=move_timeout_per_rotator):
+                    self.logger.error(
+                        f"Rotator {rotator.name} (Addr: {rotator.physical_address}) "
+                        f"did not report ready status after move within timeout."
+                    )
+                    all_ready = False
+
+            if all_ready:
+                self.logger.info(
+                    "All rotators in the group reported ready status after move."
+                )
+                self.logger.debug(
+                    "Updating positions for all rotators in the group..."
+                )
+                for rotator in self.rotators:
+                    rotator.update_position()
+                return True
+            else:
+                self.logger.error(
+                    "Not all rotators in the group became ready after move."
+                )
+                return False
+        else:
+            # Not waiting, return based on initial replies
+            if replies:
+                self.logger.info(
+                    "Group move_absolute command dispatched successfully "
+                    "(not waiting for completion)."
+                )
+                return True
+            else:
+                self.logger.warning(
+                    "Group move_absolute command sent, but no replies received "
+                    "(not waiting for completion)."
+                )
+                return False
+
+    def get_group_status(self) -> Dict[str, str]:
+        """
+        Query status of all rotators in the group simultaneously.
+
+        Returns:
+            Dictionary mapping physical addresses to status codes.
+            Status codes are 2-character hex strings (e.g., '00', '01', '09').
+            If a rotator's reply is malformed, the value will be 'Error: BadFormat'.
+            If a rotator doesn't reply, it won't appear in the dictionary.
+
+        Common status codes:
+            '00': Ready (idle)
+            '01': Moving
+            '09': Homing
+
+        Example:
+            >>> statuses = group.get_group_status()
+            >>> print(statuses)
+            {'0': '00', '1': '00', '2': '09'}  # Rotator 2 is homing
+        """
+        if not self.is_grouped:
+            self.logger.error("Cannot get group status: Group not formed.")
+            return {}
+
+        self.logger.debug("Querying status of all rotators in group...")
+
+        replies = self._send_group_command_and_collect_replies(
+            command=COMMAND_GET_STATUS,
+            expect_num_replies=len(self.rotators),
+        )
+
+        # Parse status codes from replies
+        statuses: Dict[str, str] = {}
+        for phys_addr, reply in replies.items():
+            # Expected format: <addr>GS<status>
+            # e.g., "0GS00", "1GS09"
+            expected_prefix = f"{phys_addr}GS"
+            if reply.startswith(expected_prefix):
+                status_code = reply[len(expected_prefix) :].strip()
+                statuses[phys_addr] = status_code
+                self.logger.trace(
+                    f"Rotator {phys_addr} status: {status_code}"
+                )
+            else:
+                self.logger.warning(
+                    f"Malformed status reply from rotator {phys_addr}: '{reply}'"
+                )
+                statuses[phys_addr] = "Error: BadFormat"
+
+        self.logger.debug(
+            f"Got status for {len(statuses)}/{len(self.rotators)} rotators"
+        )
+        return statuses

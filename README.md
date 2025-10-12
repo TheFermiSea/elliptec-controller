@@ -143,7 +143,50 @@ The implementation uses per-command response queues for improved reliability and
 
 ### Synchronized Group Movement
 
-Control multiple rotators simultaneously with individual offsets:
+#### Method 1: Using ElliptecGroupController (Recommended)
+
+The `ElliptecGroupController` provides a high-level interface for managing groups of rotators:
+
+```python
+from elliptec_controller import ElliptecRotator, ElliptecGroupController
+
+# Initialize rotators on the same serial port
+rotator1 = ElliptecRotator("/dev/ttyUSB0", motor_address=0, name="Rotator-0", auto_home=False)
+rotator2 = ElliptecRotator("/dev/ttyUSB0", motor_address=1, name="Rotator-1", auto_home=False)
+rotator3 = ElliptecRotator("/dev/ttyUSB0", motor_address=2, name="Rotator-2", auto_home=False)
+
+# Create group controller (first rotator is master by default)
+group = ElliptecGroupController(
+    rotators=[rotator1, rotator2, rotator3],
+    master_rotator_physical_address='0'  # Optional: explicitly set master
+)
+
+# Form the group (slaves listen to master's address)
+group.form_group()
+
+# Or form with custom group address and slave offsets
+group.form_group(
+    group_address_char='A',  # Custom group address
+    slave_offsets={'1': 10.0, '2': -15.0}  # Individual offsets in degrees
+)
+
+# Synchronized operations - all rotators move together
+group.home_group(wait=True)                    # Home all rotators
+group.move_group_absolute(45.0, wait=True)     # Move all to 45° (with offsets)
+group.stop_group()                             # Emergency stop all rotators
+
+# Query group status
+statuses = group.get_group_status()
+for addr, status in statuses.items():
+    print(f"Rotator {addr}: {status}")
+
+# Disband when done
+group.disband_group()
+```
+
+#### Method 2: Manual Group Configuration (Low-Level)
+
+For direct control without the group controller:
 
 ```python
 from elliptec_controller import ElliptecRotator
@@ -306,6 +349,52 @@ ElliptecRotator(port, motor_address, name=None, auto_home=True)
 #### Group Control Methods
 - `configure_as_group_slave(master_address, offset_degrees)`: Configure for synchronized movement
 - `revert_from_group_slave()`: Return to individual control
+
+### ElliptecGroupController Class
+
+High-level controller for managing multiple synchronized rotators.
+
+#### Initialization
+```python
+ElliptecGroupController(rotators, master_rotator_physical_address=None)
+```
+
+**Parameters:**
+- `rotators`: List of `ElliptecRotator` instances (must share same serial port)
+- `master_rotator_physical_address`: Physical address of master rotator (defaults to first in list)
+
+#### Key Methods
+
+**Group Formation & Management:**
+- `form_group(group_address_char=None, slave_offsets=None)`: Form synchronized group
+  - `group_address_char`: Group address ('0'-'F'), defaults to master's address
+  - `slave_offsets`: Dict mapping physical addresses to offset angles (degrees)
+  - Returns: `True` if successful, `False` otherwise
+
+- `disband_group()`: Disband group, revert all rotators to individual control
+  - Returns: `True` if all rotators reverted successfully
+
+**Group Operations:**
+- `home_group(wait=True, home_timeout_per_rotator=2.0)`: Home all rotators simultaneously
+  - `wait`: Block until complete if `True`
+  - Returns: `True` if successful
+
+- `move_group_absolute(degrees, wait=True, move_timeout_per_rotator=45.0)`: Move all rotators to position
+  - `degrees`: Target absolute position (0-360)
+  - `wait`: Block until complete if `True`
+  - Returns: `True` if successful
+
+- `stop_group()`: Send emergency stop to all rotators
+  - Returns: `True` if all acknowledged stop command
+
+- `get_group_status()`: Query status of all rotators
+  - Returns: Dict mapping physical addresses to status codes ('00'=ready, '01'=moving, '09'=homing)
+
+**Properties:**
+- `is_grouped`: Boolean indicating if group is currently formed
+- `master_rotator`: Reference to the master rotator instance
+- `rotators`: List of all rotators in the group
+- `group_master_address_char`: Current group address (or `None` if not formed)
 
 ## Examples
 
